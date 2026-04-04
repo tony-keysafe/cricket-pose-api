@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_URL = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n-pose.onnx"
+MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
 session = None
 
