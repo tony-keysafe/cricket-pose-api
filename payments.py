@@ -62,14 +62,10 @@ def init_stripe():
         logger.error("stripe package not installed — run: pip install stripe")
         return False
 
-def _stripe_required(func):
-    """Decorator that returns 503 if Stripe isn't configured."""
-    async def wrapper(*args, **kwargs):
-        if stripe is None:
-            raise HTTPException(status_code=503, detail="Payment system not configured. Set STRIPE_SECRET_KEY.")
-        return await func(*args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
+def _require_stripe():
+    """Raise 503 if Stripe isn't configured."""
+    if stripe is None:
+        raise HTTPException(status_code=503, detail="Payment system not configured. Set STRIPE_SECRET_KEY.")
 
 # ─── Customer Store (simple JSON — replace with DB) ──────────────
 def _load_customers():
@@ -99,7 +95,6 @@ def _set_customer(email, data):
 # ─── Endpoints ───────────────────────────────────────────────────
 
 @router.post("/checkout/create")
-@_stripe_required
 async def create_checkout(request: Request):
     """
     Create a Stripe Checkout session for subscription purchase.
@@ -110,6 +105,7 @@ async def create_checkout(request: Request):
     Returns:
       { "checkout_url": "https://checkout.stripe.com/..." }
     """
+    _require_stripe()
     body = await request.json()
     email = body.get("email", "").strip().lower()
     plan = body.get("plan", "pro").lower()
@@ -155,7 +151,6 @@ async def create_checkout(request: Request):
 
 
 @router.post("/portal/create")
-@_stripe_required
 async def create_portal(request: Request):
     """
     Create a Stripe Customer Portal session for managing subscription.
@@ -166,6 +161,7 @@ async def create_portal(request: Request):
     Returns:
       { "portal_url": "https://billing.stripe.com/..." }
     """
+    _require_stripe()
     body = await request.json()
     email = body.get("email", "").strip().lower()
 
@@ -182,7 +178,6 @@ async def create_portal(request: Request):
 
 
 @router.get("/subscription/status")
-@_stripe_required
 async def subscription_status(request: Request):
     """
     Check subscription status for an email.
@@ -193,6 +188,7 @@ async def subscription_status(request: Request):
     Returns:
       { "plan": "free"|"pro"|"team", "status": "active"|"inactive"|"past_due", "email": "..." }
     """
+    _require_stripe()
     email = request.query_params.get("email", "").strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email required")
