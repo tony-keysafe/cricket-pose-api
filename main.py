@@ -33,7 +33,7 @@ app.add_middleware(
 
 MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
-INPUT_SIZE = 416  # Reduced from 640 — ~40% faster, minimal quality loss at net distances
+INPUT_SIZE = 640  # Model has fixed 640x640 input dimensions
 session = None
 
 # In-memory job store (fine for single-instance Railway deployment)
