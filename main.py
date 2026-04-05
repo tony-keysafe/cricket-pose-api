@@ -23,6 +23,10 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Cricket Analyze Pro - Pose API")
 
+# ─── Payment routes ──────────────────────────────────────────────
+from payments import router as payments_router, init_stripe
+app.include_router(payments_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -230,6 +234,11 @@ async def startup():
     dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
     session.run(None, {session.get_inputs()[0].name: dummy})
     print("Model warmed up!")
+    # Initialize Stripe (optional — works without it)
+    if init_stripe():
+        print("Stripe payment system ready")
+    else:
+        print("Stripe not configured — payment endpoints disabled")
 
 
 @app.get("/health")
