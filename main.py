@@ -130,6 +130,45 @@ def postprocess(output, scale, conf_thresh=0.25):
     return mp_landmarks, round(total_conf / max(count, 1), 3)
 
 
+def detect_slomo(path):
+    """Detect iPhone slo-mo videos and return the speedup factor needed."""
+    try:
+        import subprocess, json
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", path],
+            capture_output=True, text=True, timeout=10
+        )
+        data = json.loads(result.stdout)
+
+        # Check for Apple slo-mo indicator
+        tags = data.get("format", {}).get("tags", {})
+        full_rate = tags.get("com.apple.quicktime.full-frame-rate-playback-intent", "1")
+
+        # Check time_base for high native fps
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                time_base = stream.get("time_base", "")
+                r_frame_rate = stream.get("r_frame_rate", "0/1")
+                # Parse time_base denominator (e.g. "1/2400" → 2400)
+                tb_denom = int(time_base.split("/")[1]) if "/" in time_base else 0
+                # Parse display fps
+                num, den = r_frame_rate.split("/") if "/" in r_frame_rate else ("0", "1")
+                display_fps = int(num) / max(int(den), 1)
+
+                # If time_base suggests much higher fps than display fps, it's slo-mo
+                # e.g. time_base=1/2400 with display 60fps → native 240fps → 4x slowdown
+                if tb_denom >= 240 and display_fps < 120 and full_rate == "0":
+                    # Native fps is approximately time_base_denom / 10
+                    native_fps = tb_denom / 10  # 2400/10=240, 1200/10=120
+                    factor = native_fps / display_fps
+                    if factor > 1.5:
+                        return round(factor, 1)
+        return 1.0
+    except Exception as e:
+        print(f"Slo-mo detection failed: {e}")
+        return 1.0
+
+
 def process_video(job_id):
     """Background thread: process video frames and update job progress."""
     job = jobs[job_id]
@@ -137,6 +176,10 @@ def process_video(job_id):
     fps_hint = job["fps"]
 
     try:
+        # Detect slo-mo before opening with OpenCV
+        slomo_factor = detect_slomo(tmp_path)
+        print(f"Slo-mo detection: factor={slomo_factor}")
+
         cap = cv2.VideoCapture(tmp_path)
         video_fps = cap.get(cv2.CAP_PROP_FPS) or fps_hint
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -167,7 +210,9 @@ def process_video(job_id):
             "total_frames": total_frames,
             "duration": round(total_frames / video_fps, 3) if video_fps > 0 else 0,
             "analysis_fps": round(analysis_fps, 1),
-            "skip_factor": skip,
+            "effective_fps": round(analysis_fps * slomo_factor, 1),  # Real-time fps after slo-mo correction
+            "slomo_factor": slomo_factor,
+            "real_duration": round(total_frames / video_fps / slomo_factor, 3) if video_fps > 0 else 0,
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
@@ -185,7 +230,7 @@ def process_video(job_id):
             if not ret:
                 break
 
-            time_s = target_frame / video_fps
+            time_s = target_frame / video_fps / slomo_factor  # Correct for slo-mo playback
             blob, scale = preprocess(frame)
             outputs = session.run(None, {input_name: blob})
             landmarks, confidence = postprocess(outputs, scale)
