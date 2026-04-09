@@ -243,7 +243,7 @@ def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
 
 
 def process_ball_tracking(job_id):
-    """Background thread: detect ball using ML model or frame-diff fallback with bowler masking."""
+    """Background thread: detect ball using ML model or smart frame-diff fallback."""
     job = jobs[job_id]
     tmp_path = job["tmp_path"]
     use_ml = ball_session is not None
@@ -256,7 +256,7 @@ def process_ball_tracking(job_id):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        skip = max(1, int(video_fps / 30))  # Target ~30 analysis fps
+        skip = max(1, int(video_fps / 30))
         total_analysis = total_frames // skip
         job["video_info"] = {
             "width": width, "height": height,
@@ -264,109 +264,139 @@ def process_ball_tracking(job_id):
             "total_frames": total_frames,
             "slomo_factor": slomo_factor,
             "real_duration": round(total_frames / video_fps / slomo_factor, 3),
-            "method": "yolov8" if use_ml else "frame_diff_masked",
+            "method": "yolov8" if use_ml else "bg_subtract",
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
 
-        ball_positions = []
+        # ═══ PASS 1: Collect all ball candidates ═══
+        raw_candidates = []
         frames_done = 0
-        prev_gray = None
 
-        target_frame = 0
-        while target_frame < total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            time_s = target_frame / video_fps / slomo_factor
-
-            if use_ml:
-                # ML ball detection
-                input_name = ball_session.get_inputs()[0].name
+        if use_ml:
+            input_name = ball_session.get_inputs()[0].name
+            target_frame = 0
+            while target_frame < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                time_s = target_frame / video_fps / slomo_factor
                 blob, scale = preprocess(frame)
                 outputs = ball_session.run(None, {input_name: blob})
                 detections = postprocess_ball(outputs, scale, width, height)
                 if detections:
                     best = detections[0]
-                    ball_positions.append({
+                    raw_candidates.append({
                         "frame": target_frame, "time": round(time_s, 4),
                         "x": best["nx"], "y": best["ny"],
-                        "px": best["x"], "py": best["y"],
                         "conf": best["confidence"],
                     })
-            else:
-                # Frame-diff fallback: use pose model to find bowler, mask them, detect ball
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 50)
+                target_frame += skip
+        else:
+            # Background subtraction approach
+            # Step 1: Build background model from first 10 frames
+            bg_frames = []
+            for i in range(min(10, total_frames)):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i * max(1, total_frames // 10))
+                ret, frame = cap.read()
+                if ret:
+                    bg_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+            bg_model = np.median(np.array(bg_frames), axis=0).astype(np.uint8) if bg_frames else None
+
+            # Step 2: Find bowler position once (from middle of video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 3)
+            ret, mid_frame = cap.read()
+            bowler_mask = np.ones((height, width), dtype=np.uint8) * 255
+            if ret:
+                input_name = session.get_inputs()[0].name
+                blob, scale = preprocess(mid_frame)
+                outputs = session.run(None, {input_name: blob})
+                landmarks, conf = postprocess(outputs, scale)
+                if landmarks and conf > 0.2:
+                    xs = [lm["x"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.1]
+                    ys = [lm["y"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.1]
+                    if xs and ys:
+                        pad = int(min(width, height) * 0.12)
+                        x1 = max(0, int(min(xs)) - pad)
+                        y1 = max(0, int(min(ys)) - pad)
+                        x2 = min(width, int(max(xs)) + pad)
+                        y2 = min(height, int(max(ys)) + pad)
+                        bowler_mask[y1:y2, x1:x2] = 0
+
+            # Step 3: Pitch-only mask (center 40% of frame)
+            pitch_mask = np.zeros((height, width), dtype=np.uint8)
+            px1 = int(width * 0.30)
+            px2 = int(width * 0.70)
+            pitch_mask[:, px1:px2] = 255
+
+            # Combine masks
+            combined_mask = cv2.bitwise_and(bowler_mask, pitch_mask)
+
+            # Max ball size in pixels (ball appears ~0.5-2% of frame width)
+            max_ball_area = int(width * height * 0.003)
+            min_ball_area = 3
+
+            # Step 4: Process frames
+            target_frame = 0
+            while target_frame < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                time_s = target_frame / video_fps / slomo_factor
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-                if prev_gray is not None:
-                    # Get bowler position from pose model to mask them
-                    input_name = session.get_inputs()[0].name
-                    blob, scale = preprocess(frame)
-                    outputs = session.run(None, {input_name: blob})
-                    landmarks, confidence = postprocess(outputs, scale)
+                if bg_model is not None:
+                    # Subtract background
+                    diff = cv2.absdiff(gray, bg_model)
+                    diff = cv2.bitwise_and(diff, combined_mask)
+                    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+                    # Erode to remove noise, dilate to connect ball pixels
+                    kernel = np.ones((2, 2), np.uint8)
+                    thresh = cv2.erode(thresh, kernel, iterations=1)
+                    thresh = cv2.dilate(thresh, kernel, iterations=1)
 
-                    # Create mask excluding the bowler (expand bounding box around detected person)
-                    mask = np.ones_like(gray, dtype=np.uint8) * 255
-                    if landmarks and confidence > 0.3:
-                        xs = [lm["x"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.2]
-                        ys = [lm["y"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.2]
-                        if xs and ys:
-                            pad = int(min(width, height) * 0.08)
-                            x1 = max(0, int(min(xs)) - pad)
-                            y1 = max(0, int(min(ys)) - pad)
-                            x2 = min(width, int(max(xs)) + pad)
-                            y2 = min(height, int(max(ys)) + pad)
-                            mask[y1:y2, x1:x2] = 0  # Mask out bowler area
-
-                    # Frame difference with bowler masked
-                    diff = cv2.absdiff(prev_gray, gray)
-                    diff = cv2.bitwise_and(diff, mask)
-                    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-
-                    # Find contours — ball should be small and compact
                     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    best_ball = None
-                    best_score = 0
                     for cnt in contours:
                         area = cv2.contourArea(cnt)
-                        if area < 5 or area > width * height * 0.01:  # Ball is small
+                        if area < min_ball_area or area > max_ball_area:
                             continue
                         x, y, bw, bh = cv2.boundingRect(cnt)
+                        # Ball is roughly circular (aspect ratio < 2.5)
                         aspect = max(bw, bh) / max(min(bw, bh), 1)
-                        if aspect > 3:  # Ball is roughly circular
+                        if aspect > 2.5:
                             continue
                         cx = (x + bw / 2) / width
                         cy = (y + bh / 2) / height
-                        # Prefer compact, central objects
-                        score = area * (1 if 0.2 < cx < 0.8 else 0.3)
-                        if score > best_score:
-                            best_score = score
-                            best_ball = {"x": round(cx, 4), "y": round(cy, 4), "area": area}
-
-                    if best_ball:
-                        ball_positions.append({
+                        raw_candidates.append({
                             "frame": target_frame, "time": round(time_s, 4),
-                            "x": best_ball["x"], "y": best_ball["y"],
-                            "conf": 0.5,
+                            "x": round(cx, 4), "y": round(cy, 4),
+                            "conf": round(min(1.0, area / 20), 2),
                         })
 
-                prev_gray = gray
-
-            frames_done += 1
-            job["frames_done"] = frames_done
-            job["progress"] = round((frames_done / max(total_analysis, 1)) * 100)
-            target_frame += skip
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 50)
+                target_frame += skip
 
         cap.release()
+        print(f"Ball job {job_id}: {len(raw_candidates)} raw candidates")
+
+        # ═══ PASS 2: Filter trajectory — keep only positions forming a coherent path ═══
+        ball_positions = filter_ball_trajectory(raw_candidates, width, height)
+
         job["ball_positions"] = ball_positions
         job["video_info"]["frames_analyzed"] = frames_done
-        job["video_info"]["ball_detections"] = len(ball_positions)
+        job["video_info"]["raw_candidates"] = len(raw_candidates)
+        job["video_info"]["filtered_positions"] = len(ball_positions)
         job["status"] = "complete"
         job["progress"] = 100
-        print(f"Ball job {job_id}: {len(ball_positions)} detections in {frames_done} frames ({job['video_info']['method']})")
+        print(f"Ball job {job_id}: {len(ball_positions)} filtered positions from {len(raw_candidates)} candidates ({job['video_info']['method']})")
 
     except Exception as e:
         job["status"] = "error"
@@ -380,6 +410,61 @@ def process_ball_tracking(job_id):
                 os.unlink(tmp_path)
         except Exception:
             pass
+
+
+def filter_ball_trajectory(candidates, width, height):
+    """Filter raw candidates to find the most likely ball trajectory.
+    Ball should form a roughly straight/parabolic path from top to bottom."""
+    if len(candidates) < 3:
+        return candidates
+
+    # Group candidates by time into potential deliveries
+    # A delivery takes ~0.3-1.0 seconds in real time
+    deliveries = []
+    current = [candidates[0]]
+    for i in range(1, len(candidates)):
+        time_gap = candidates[i]["time"] - candidates[i - 1]["time"]
+        if time_gap > 0.15:  # Gap > 150ms = new delivery or noise
+            if len(current) >= 3:
+                deliveries.append(current)
+            current = []
+        current.append(candidates[i])
+    if len(current) >= 3:
+        deliveries.append(current)
+
+    if not deliveries:
+        return []
+
+    # Score each potential delivery by trajectory smoothness
+    best_delivery = None
+    best_score = -1
+
+    for delivery in deliveries:
+        if len(delivery) < 3:
+            continue
+
+        # Ball should move mostly downward (Y increases) and stay roughly centered
+        y_vals = [p["y"] for p in delivery]
+        x_vals = [p["x"] for p in delivery]
+
+        # Check Y is generally increasing (ball moving towards camera)
+        y_increasing = sum(1 for i in range(1, len(y_vals)) if y_vals[i] > y_vals[i-1])
+        y_ratio = y_increasing / max(len(y_vals) - 1, 1)
+
+        # Check X stays within reasonable lateral range (ball doesn't zig-zag wildly)
+        x_range = max(x_vals) - min(x_vals)
+
+        # Trajectory span (should cover significant portion of frame)
+        y_span = max(y_vals) - min(y_vals)
+
+        # Score: prefer long, smooth, downward trajectories
+        score = y_span * y_ratio * len(delivery) / max(x_range * 10, 0.1)
+
+        if score > best_score and y_ratio > 0.5 and y_span > 0.1:
+            best_score = score
+            best_delivery = delivery
+
+    return best_delivery or []
 
 
 def process_video(job_id):
