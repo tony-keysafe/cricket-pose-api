@@ -42,8 +42,11 @@ app.add_middleware(
 
 MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
+BALL_MODEL_URL = "https://huggingface.co/Xenova/yolov8n/resolve/main/yolov8n.onnx"
+BALL_MODEL_PATH = "/app/yolov8n.onnx"
 INPUT_SIZE = 640  # Model has fixed 640x640 input dimensions
 session = None
+ball_session = None
 
 # In-memory job store (fine for single-instance Railway deployment)
 jobs = {}
@@ -64,23 +67,27 @@ def cleanup_jobs():
 
 
 def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
-        print(f"Model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
-        return
-    if os.path.exists(MODEL_PATH):
-        os.remove(MODEL_PATH)
-    print(f"Downloading model from {MODEL_URL}...")
-    r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
-    r.raise_for_status()
-    total = 0
-    with open(MODEL_PATH, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=65536):
-            f.write(chunk)
-            total += len(chunk)
-    size = os.path.getsize(MODEL_PATH)
-    print(f"Model downloaded: {size/1e6:.1f} MB ({total} bytes written)")
-    if size < 1000000:
-        raise RuntimeError(f"Model file too small ({size} bytes), download likely failed")
+    for url, path, name in [
+        (MODEL_URL, MODEL_PATH, "pose"),
+        (BALL_MODEL_URL, BALL_MODEL_PATH, "ball detection"),
+    ]:
+        if os.path.exists(path) and os.path.getsize(path) > 1000000:
+            print(f"{name} model already exists: {os.path.getsize(path)/1e6:.1f} MB")
+            continue
+        if os.path.exists(path):
+            os.remove(path)
+        print(f"Downloading {name} model from {url}...")
+        r = requests.get(url, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        total = 0
+        with open(path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+                total += len(chunk)
+        size = os.path.getsize(path)
+        print(f"{name} model downloaded: {size/1e6:.1f} MB")
+        if size < 1000000:
+            raise RuntimeError(f"{name} model file too small ({size} bytes)")
 
 
 def preprocess(frame, input_size=INPUT_SIZE):
@@ -167,6 +174,143 @@ def detect_slomo(path):
     except Exception as e:
         print(f"Slo-mo detection failed: {e}")
         return 1.0
+
+
+def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
+    """Extract sports ball detections from YOLOv8 detection model output."""
+    predictions = output[0]
+    if len(predictions.shape) == 3:
+        predictions = predictions[0].T  # (8400, 84) for COCO 80 classes
+
+    if len(predictions) == 0:
+        return []
+
+    # YOLOv8 detection format: [x_center, y_center, w, h, class0_conf, class1_conf, ...]
+    # COCO class 32 = sports ball
+    SPORTS_BALL_CLASS = 32
+    boxes = predictions[:, :4]
+    class_scores = predictions[:, 4:]  # 80 classes
+
+    if class_scores.shape[1] <= SPORTS_BALL_CLASS:
+        return []
+
+    ball_scores = class_scores[:, SPORTS_BALL_CLASS]
+    mask = ball_scores > conf_thresh
+    ball_boxes = boxes[mask]
+    ball_confs = ball_scores[mask]
+
+    if len(ball_boxes) == 0:
+        return []
+
+    detections = []
+    for i in range(len(ball_boxes)):
+        cx, cy, bw, bh = ball_boxes[i]
+        # Scale back to original image coordinates
+        detections.append({
+            "x": round(float(cx / scale), 1),
+            "y": round(float(cy / scale), 1),
+            "w": round(float(bw / scale), 1),
+            "h": round(float(bh / scale), 1),
+            "confidence": round(float(ball_confs[i]), 3),
+            # Normalized coordinates (0-1 range)
+            "nx": round(float(cx / scale / w), 4),
+            "ny": round(float(cy / scale / h), 4),
+        })
+
+    # Sort by confidence, return best detection
+    detections.sort(key=lambda d: d["confidence"], reverse=True)
+    return detections[:3]  # Top 3 candidates
+
+
+def process_ball_tracking(job_id):
+    """Background thread: detect ball in each frame and return positions."""
+    job = jobs[job_id]
+    tmp_path = job["tmp_path"]
+
+    try:
+        slomo_factor = detect_slomo(tmp_path)
+        cap = cv2.VideoCapture(tmp_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # For ball detection, analyze MORE frames (every frame for slo-mo, every 2nd for 30fps)
+        if video_fps <= 30:
+            skip = 1
+        elif video_fps <= 60:
+            skip = 2
+        elif video_fps <= 120:
+            skip = 3
+        else:
+            skip = 4
+
+        total_analysis = total_frames // skip
+        job["video_info"] = {
+            "width": width, "height": height,
+            "fps": round(video_fps, 2),
+            "total_frames": total_frames,
+            "slomo_factor": slomo_factor,
+            "real_duration": round(total_frames / video_fps / slomo_factor, 3),
+        }
+        job["total_frames"] = total_analysis
+        job["status"] = "processing"
+
+        ball_positions = []
+        frames_done = 0
+        input_name = ball_session.get_inputs()[0].name
+
+        target_frame = 0
+        while target_frame < total_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            time_s = target_frame / video_fps / slomo_factor
+            blob, scale = preprocess(frame)
+            outputs = ball_session.run(None, {input_name: blob})
+            detections = postprocess_ball(outputs, scale, width, height)
+
+            if detections:
+                best = detections[0]
+                ball_positions.append({
+                    "frame": target_frame,
+                    "time": round(time_s, 4),
+                    "x": best["nx"],
+                    "y": best["ny"],
+                    "px": best["x"],
+                    "py": best["y"],
+                    "conf": best["confidence"],
+                    "w": best["w"],
+                    "h": best["h"],
+                })
+
+            frames_done += 1
+            job["frames_done"] = frames_done
+            job["progress"] = round((frames_done / max(total_analysis, 1)) * 100)
+            target_frame += skip
+
+        cap.release()
+
+        job["ball_positions"] = ball_positions
+        job["video_info"]["frames_analyzed"] = frames_done
+        job["status"] = "complete"
+        job["progress"] = 100
+        print(f"Ball job {job_id}: complete — {len(ball_positions)} ball detections in {frames_done} frames")
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        print(f"Ball job {job_id}: error — {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def process_video(job_id):
@@ -270,15 +414,18 @@ def process_video(job_id):
 
 @app.on_event("startup")
 async def startup():
-    global session
+    global session, ball_session
     download_model()
-    print("Loading ONNX model...")
+    print("Loading ONNX models...")
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-    print(f"Model loaded! Input: {session.get_inputs()[0].shape}")
-    # Warm up with a dummy inference
+    print(f"Pose model loaded! Input: {session.get_inputs()[0].shape}")
+    ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
+    print(f"Ball detection model loaded! Input: {ball_session.get_inputs()[0].shape}")
+    # Warm up both models
     dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
     session.run(None, {session.get_inputs()[0].name: dummy})
-    print("Model warmed up!")
+    ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
+    print("Models warmed up!")
     # Initialize Stripe (optional — works without it)
     if init_stripe():
         print("Stripe payment system ready")
@@ -365,6 +512,65 @@ def get_results(job_id: str):
     return JSONResponse(content={
         "video_info": job["video_info"],
         "frames": job["frames"],
+    })
+
+
+# ─── Ball Detection endpoints ─────────────────────────────────
+
+@app.post("/detect-ball")
+async def detect_ball_video(
+    video: UploadFile = File(...),
+):
+    """Upload video for ball tracking. Returns job_id — poll /ball-status/{job_id}."""
+    cleanup_jobs()
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        content = await video.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    job_id = "ball-" + str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "frames_done": 0,
+        "total_frames": 0,
+        "created_at": time.time(),
+        "tmp_path": tmp_path,
+    }
+
+    thread = threading.Thread(target=process_ball_tracking, args=(job_id,), daemon=True)
+    thread.start()
+
+    return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+
+@app.get("/ball-status/{job_id}")
+def get_ball_status(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    job = jobs[job_id]
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "frames_done": job.get("frames_done", 0),
+        "total_frames": job.get("total_frames", 0),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/ball-results/{job_id}")
+def get_ball_results(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    job = jobs[job_id]
+    if job["status"] != "complete":
+        return JSONResponse(status_code=202, content={"status": job["status"]})
+
+    return JSONResponse(content={
+        "video_info": job.get("video_info", {}),
+        "ball_positions": job.get("ball_positions", []),
     })
 
 
