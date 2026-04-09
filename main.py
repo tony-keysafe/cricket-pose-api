@@ -42,8 +42,11 @@ app.add_middleware(
 
 MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
-BALL_MODEL_URL = "https://huggingface.co/Xenova/yolov8n/resolve/main/yolov8n.onnx"
-BALL_MODEL_PATH = "/app/yolov8n.onnx"
+BALL_MODEL_URLS = [
+    "https://huggingface.co/Xenova/yolov8s/resolve/main/onnx/model.onnx",
+    "https://huggingface.co/qualcomm/YOLOv8-Detection-Nano/resolve/main/YOLOv8-Detection-Nano.onnx",
+]
+BALL_MODEL_PATH = "/app/yolov8-detect.onnx"
 INPUT_SIZE = 640  # Model has fixed 640x640 input dimensions
 session = None
 ball_session = None
@@ -67,27 +70,44 @@ def cleanup_jobs():
 
 
 def download_model():
-    for url, path, name in [
-        (MODEL_URL, MODEL_PATH, "pose"),
-        (BALL_MODEL_URL, BALL_MODEL_PATH, "ball detection"),
-    ]:
-        if os.path.exists(path) and os.path.getsize(path) > 1000000:
-            print(f"{name} model already exists: {os.path.getsize(path)/1e6:.1f} MB")
-            continue
-        if os.path.exists(path):
-            os.remove(path)
-        print(f"Downloading {name} model from {url}...")
-        r = requests.get(url, allow_redirects=True, stream=True)
+    # Pose model (required)
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
+        print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
+    else:
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+        print(f"Downloading pose model...")
+        r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
         r.raise_for_status()
-        total = 0
-        with open(path, 'wb') as f:
+        with open(MODEL_PATH, 'wb') as f:
             for chunk in r.iter_content(chunk_size=65536):
                 f.write(chunk)
-                total += len(chunk)
-        size = os.path.getsize(path)
-        print(f"{name} model downloaded: {size/1e6:.1f} MB")
-        if size < 1000000:
-            raise RuntimeError(f"{name} model file too small ({size} bytes)")
+        print(f"Pose model: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
+
+    # Ball detection model (optional — try multiple sources)
+    if os.path.exists(BALL_MODEL_PATH) and os.path.getsize(BALL_MODEL_PATH) > 1000000:
+        print(f"Ball model already exists: {os.path.getsize(BALL_MODEL_PATH)/1e6:.1f} MB")
+    else:
+        for url in BALL_MODEL_URLS:
+            try:
+                print(f"Trying ball model: {url}")
+                r = requests.get(url, allow_redirects=True, stream=True, timeout=30)
+                r.raise_for_status()
+                with open(BALL_MODEL_PATH, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                size = os.path.getsize(BALL_MODEL_PATH)
+                if size > 1000000:
+                    print(f"Ball model downloaded: {size/1e6:.1f} MB from {url}")
+                    break
+                else:
+                    os.remove(BALL_MODEL_PATH)
+            except Exception as e:
+                print(f"Ball model download failed from {url}: {e}")
+                if os.path.exists(BALL_MODEL_PATH):
+                    os.remove(BALL_MODEL_PATH)
+        if not os.path.exists(BALL_MODEL_PATH):
+            print("WARNING: Ball detection model not available — /detect-ball will use frame differencing fallback")
 
 
 def preprocess(frame, input_size=INPUT_SIZE):
@@ -223,9 +243,10 @@ def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
 
 
 def process_ball_tracking(job_id):
-    """Background thread: detect ball in each frame and return positions."""
+    """Background thread: detect ball using ML model or frame-diff fallback with bowler masking."""
     job = jobs[job_id]
     tmp_path = job["tmp_path"]
+    use_ml = ball_session is not None
 
     try:
         slomo_factor = detect_slomo(tmp_path)
@@ -235,16 +256,7 @@ def process_ball_tracking(job_id):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # For ball detection, analyze MORE frames (every frame for slo-mo, every 2nd for 30fps)
-        if video_fps <= 30:
-            skip = 1
-        elif video_fps <= 60:
-            skip = 2
-        elif video_fps <= 120:
-            skip = 3
-        else:
-            skip = 4
-
+        skip = max(1, int(video_fps / 30))  # Target ~30 analysis fps
         total_analysis = total_frames // skip
         job["video_info"] = {
             "width": width, "height": height,
@@ -252,13 +264,14 @@ def process_ball_tracking(job_id):
             "total_frames": total_frames,
             "slomo_factor": slomo_factor,
             "real_duration": round(total_frames / video_fps / slomo_factor, 3),
+            "method": "yolov8" if use_ml else "frame_diff_masked",
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
 
         ball_positions = []
         frames_done = 0
-        input_name = ball_session.get_inputs()[0].name
+        prev_gray = None
 
         target_frame = 0
         while target_frame < total_frames:
@@ -268,23 +281,79 @@ def process_ball_tracking(job_id):
                 break
 
             time_s = target_frame / video_fps / slomo_factor
-            blob, scale = preprocess(frame)
-            outputs = ball_session.run(None, {input_name: blob})
-            detections = postprocess_ball(outputs, scale, width, height)
 
-            if detections:
-                best = detections[0]
-                ball_positions.append({
-                    "frame": target_frame,
-                    "time": round(time_s, 4),
-                    "x": best["nx"],
-                    "y": best["ny"],
-                    "px": best["x"],
-                    "py": best["y"],
-                    "conf": best["confidence"],
-                    "w": best["w"],
-                    "h": best["h"],
-                })
+            if use_ml:
+                # ML ball detection
+                input_name = ball_session.get_inputs()[0].name
+                blob, scale = preprocess(frame)
+                outputs = ball_session.run(None, {input_name: blob})
+                detections = postprocess_ball(outputs, scale, width, height)
+                if detections:
+                    best = detections[0]
+                    ball_positions.append({
+                        "frame": target_frame, "time": round(time_s, 4),
+                        "x": best["nx"], "y": best["ny"],
+                        "px": best["x"], "py": best["y"],
+                        "conf": best["confidence"],
+                    })
+            else:
+                # Frame-diff fallback: use pose model to find bowler, mask them, detect ball
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+                if prev_gray is not None:
+                    # Get bowler position from pose model to mask them
+                    input_name = session.get_inputs()[0].name
+                    blob, scale = preprocess(frame)
+                    outputs = session.run(None, {input_name: blob})
+                    landmarks, confidence = postprocess(outputs, scale)
+
+                    # Create mask excluding the bowler (expand bounding box around detected person)
+                    mask = np.ones_like(gray, dtype=np.uint8) * 255
+                    if landmarks and confidence > 0.3:
+                        xs = [lm["x"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.2]
+                        ys = [lm["y"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.2]
+                        if xs and ys:
+                            pad = int(min(width, height) * 0.08)
+                            x1 = max(0, int(min(xs)) - pad)
+                            y1 = max(0, int(min(ys)) - pad)
+                            x2 = min(width, int(max(xs)) + pad)
+                            y2 = min(height, int(max(ys)) + pad)
+                            mask[y1:y2, x1:x2] = 0  # Mask out bowler area
+
+                    # Frame difference with bowler masked
+                    diff = cv2.absdiff(prev_gray, gray)
+                    diff = cv2.bitwise_and(diff, mask)
+                    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+
+                    # Find contours — ball should be small and compact
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    best_ball = None
+                    best_score = 0
+                    for cnt in contours:
+                        area = cv2.contourArea(cnt)
+                        if area < 5 or area > width * height * 0.01:  # Ball is small
+                            continue
+                        x, y, bw, bh = cv2.boundingRect(cnt)
+                        aspect = max(bw, bh) / max(min(bw, bh), 1)
+                        if aspect > 3:  # Ball is roughly circular
+                            continue
+                        cx = (x + bw / 2) / width
+                        cy = (y + bh / 2) / height
+                        # Prefer compact, central objects
+                        score = area * (1 if 0.2 < cx < 0.8 else 0.3)
+                        if score > best_score:
+                            best_score = score
+                            best_ball = {"x": round(cx, 4), "y": round(cy, 4), "area": area}
+
+                    if best_ball:
+                        ball_positions.append({
+                            "frame": target_frame, "time": round(time_s, 4),
+                            "x": best_ball["x"], "y": best_ball["y"],
+                            "conf": 0.5,
+                        })
+
+                prev_gray = gray
 
             frames_done += 1
             job["frames_done"] = frames_done
@@ -292,12 +361,12 @@ def process_ball_tracking(job_id):
             target_frame += skip
 
         cap.release()
-
         job["ball_positions"] = ball_positions
         job["video_info"]["frames_analyzed"] = frames_done
+        job["video_info"]["ball_detections"] = len(ball_positions)
         job["status"] = "complete"
         job["progress"] = 100
-        print(f"Ball job {job_id}: complete — {len(ball_positions)} ball detections in {frames_done} frames")
+        print(f"Ball job {job_id}: {len(ball_positions)} detections in {frames_done} frames ({job['video_info']['method']})")
 
     except Exception as e:
         job["status"] = "error"
@@ -419,12 +488,22 @@ async def startup():
     print("Loading ONNX models...")
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     print(f"Pose model loaded! Input: {session.get_inputs()[0].shape}")
-    ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
-    print(f"Ball detection model loaded! Input: {ball_session.get_inputs()[0].shape}")
-    # Warm up both models
+
+    if os.path.exists(BALL_MODEL_PATH) and os.path.getsize(BALL_MODEL_PATH) > 1000000:
+        try:
+            ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
+            print(f"Ball detection model loaded! Input: {ball_session.get_inputs()[0].shape}")
+        except Exception as e:
+            print(f"Ball model failed to load: {e}")
+            ball_session = None
+    else:
+        print("Ball detection model not available — will use frame-diff fallback")
+
+    # Warm up pose model
     dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
     session.run(None, {session.get_inputs()[0].name: dummy})
-    ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
+    if ball_session:
+        ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
     print("Models warmed up!")
     # Initialize Stripe (optional — works without it)
     if init_stripe():
