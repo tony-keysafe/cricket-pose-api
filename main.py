@@ -42,14 +42,9 @@ app.add_middleware(
 
 MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
-BALL_MODEL_URLS = [
-    "https://huggingface.co/Xenova/yolov8s/resolve/main/onnx/model.onnx",
-    "https://huggingface.co/qualcomm/YOLOv8-Detection-Nano/resolve/main/YOLOv8-Detection-Nano.onnx",
-]
-BALL_MODEL_PATH = "/app/yolov8-detect.onnx"
-INPUT_SIZE = 640  # Model has fixed 640x640 input dimensions
+INPUT_SIZE = 640
 session = None
-ball_session = None
+ball_session = None  # Reserved for future ML ball detection
 
 # In-memory job store (fine for single-instance Railway deployment)
 jobs = {}
@@ -70,44 +65,21 @@ def cleanup_jobs():
 
 
 def download_model():
-    # Pose model (required)
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
         print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
-    else:
-        if os.path.exists(MODEL_PATH):
-            os.remove(MODEL_PATH)
-        print(f"Downloading pose model...")
-        r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
-        r.raise_for_status()
-        with open(MODEL_PATH, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
-        print(f"Pose model: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
-
-    # Ball detection model (optional — try multiple sources)
-    if os.path.exists(BALL_MODEL_PATH) and os.path.getsize(BALL_MODEL_PATH) > 1000000:
-        print(f"Ball model already exists: {os.path.getsize(BALL_MODEL_PATH)/1e6:.1f} MB")
-    else:
-        for url in BALL_MODEL_URLS:
-            try:
-                print(f"Trying ball model: {url}")
-                r = requests.get(url, allow_redirects=True, stream=True, timeout=30)
-                r.raise_for_status()
-                with open(BALL_MODEL_PATH, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        f.write(chunk)
-                size = os.path.getsize(BALL_MODEL_PATH)
-                if size > 1000000:
-                    print(f"Ball model downloaded: {size/1e6:.1f} MB from {url}")
-                    break
-                else:
-                    os.remove(BALL_MODEL_PATH)
-            except Exception as e:
-                print(f"Ball model download failed from {url}: {e}")
-                if os.path.exists(BALL_MODEL_PATH):
-                    os.remove(BALL_MODEL_PATH)
-        if not os.path.exists(BALL_MODEL_PATH):
-            print("WARNING: Ball detection model not available — /detect-ball will use frame differencing fallback")
+        return
+    if os.path.exists(MODEL_PATH):
+        os.remove(MODEL_PATH)
+    print(f"Downloading pose model...")
+    r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
+    r.raise_for_status()
+    with open(MODEL_PATH, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            f.write(chunk)
+    size = os.path.getsize(MODEL_PATH)
+    print(f"Pose model: {size/1e6:.1f} MB")
+    if size < 1000000:
+        raise RuntimeError(f"Model file too small ({size} bytes)")
 
 
 def preprocess(frame, input_size=INPUT_SIZE):
@@ -243,10 +215,9 @@ def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
 
 
 def process_ball_tracking(job_id):
-    """Background thread: detect ball using ML model or smart frame-diff fallback."""
+    """Detect cricket ball using HSV color detection + contour analysis + trajectory fitting."""
     job = jobs[job_id]
     tmp_path = job["tmp_path"]
-    use_ml = ball_session is not None
 
     try:
         slomo_factor = detect_slomo(tmp_path)
@@ -256,7 +227,8 @@ def process_ball_tracking(job_id):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        skip = max(1, int(video_fps / 30))
+        # Analyze every frame for slo-mo, every 2nd for 30fps
+        skip = max(1, int(video_fps / 60))
         total_analysis = total_frames // skip
         job["video_info"] = {
             "width": width, "height": height,
@@ -264,130 +236,143 @@ def process_ball_tracking(job_id):
             "total_frames": total_frames,
             "slomo_factor": slomo_factor,
             "real_duration": round(total_frames / video_fps / slomo_factor, 3),
-            "method": "yolov8" if use_ml else "bg_subtract",
+            "method": "hsv_color",
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
 
-        # ═══ PASS 1: Collect all ball candidates ═══
+        # ═══ STEP 1: Build background model (median of ~15 evenly-spaced frames) ═══
+        bg_indices = np.linspace(0, total_frames - 1, 15, dtype=int)
+        bg_frames = []
+        for idx in bg_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if ret:
+                bg_frames.append(frame.astype(np.float32))
+        bg_model = np.median(np.array(bg_frames), axis=0).astype(np.uint8) if len(bg_frames) >= 5 else None
+        bg_hsv = cv2.cvtColor(bg_model, cv2.COLOR_BGR2HSV) if bg_model is not None else None
+        print(f"Ball job {job_id}: background model from {len(bg_frames)} frames")
+
+        # ═══ STEP 2: Detect ball candidates in each frame ═══
+        # HSV ranges for cricket balls
+        # Red ball: two ranges (red wraps around in HSV)
+        red_lower1 = np.array([0, 70, 50])
+        red_upper1 = np.array([12, 255, 255])
+        red_lower2 = np.array([165, 70, 50])
+        red_upper2 = np.array([180, 255, 255])
+        # Pink ball
+        pink_lower = np.array([140, 30, 100])
+        pink_upper = np.array([170, 200, 255])
+        # White ball (high value, low saturation)
+        white_lower = np.array([0, 0, 200])
+        white_upper = np.array([180, 50, 255])
+
+        # Pitch-only mask: center strip of frame
+        pitch_mask = np.zeros((height, width), dtype=np.uint8)
+        px1, px2 = int(width * 0.25), int(width * 0.75)
+        pitch_mask[:, px1:px2] = 255
+
+        # Ball size constraints (in pixels)
+        min_ball_area = max(3, int(width * height * 0.00002))  # Tiny at far end
+        max_ball_area = int(width * height * 0.005)  # Bigger close to camera
+
         raw_candidates = []
         frames_done = 0
 
-        if use_ml:
-            input_name = ball_session.get_inputs()[0].name
-            target_frame = 0
-            while target_frame < total_frames:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                time_s = target_frame / video_fps / slomo_factor
-                blob, scale = preprocess(frame)
-                outputs = ball_session.run(None, {input_name: blob})
-                detections = postprocess_ball(outputs, scale, width, height)
-                if detections:
-                    best = detections[0]
-                    raw_candidates.append({
-                        "frame": target_frame, "time": round(time_s, 4),
-                        "x": best["nx"], "y": best["ny"],
-                        "conf": best["confidence"],
-                    })
-                frames_done += 1
-                job["frames_done"] = frames_done
-                job["progress"] = round((frames_done / max(total_analysis, 1)) * 50)
-                target_frame += skip
-        else:
-            # Background subtraction approach
-            # Step 1: Build background model from first 10 frames
-            bg_frames = []
-            for i in range(min(10, total_frames)):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i * max(1, total_frames // 10))
-                ret, frame = cap.read()
-                if ret:
-                    bg_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
-            bg_model = np.median(np.array(bg_frames), axis=0).astype(np.uint8) if bg_frames else None
+        target_frame = 0
+        while target_frame < total_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            # Step 2: Find bowler position once (from middle of video)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 3)
-            ret, mid_frame = cap.read()
-            bowler_mask = np.ones((height, width), dtype=np.uint8) * 255
-            if ret:
-                input_name = session.get_inputs()[0].name
-                blob, scale = preprocess(mid_frame)
-                outputs = session.run(None, {input_name: blob})
-                landmarks, conf = postprocess(outputs, scale)
-                if landmarks and conf > 0.2:
-                    xs = [lm["x"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.1]
-                    ys = [lm["y"] for lm in landmarks if lm and lm.get("visibility", 0) > 0.1]
-                    if xs and ys:
-                        pad = int(min(width, height) * 0.12)
-                        x1 = max(0, int(min(xs)) - pad)
-                        y1 = max(0, int(min(ys)) - pad)
-                        x2 = min(width, int(max(xs)) + pad)
-                        y2 = min(height, int(max(ys)) + pad)
-                        bowler_mask[y1:y2, x1:x2] = 0
+            time_s = target_frame / video_fps / slomo_factor
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            # Step 3: Pitch-only mask (center 40% of frame)
-            pitch_mask = np.zeros((height, width), dtype=np.uint8)
-            px1 = int(width * 0.30)
-            px2 = int(width * 0.70)
-            pitch_mask[:, px1:px2] = 255
+            # Color masks for ball
+            mask_red = cv2.bitwise_or(
+                cv2.inRange(hsv, red_lower1, red_upper1),
+                cv2.inRange(hsv, red_lower2, red_upper2)
+            )
+            mask_pink = cv2.inRange(hsv, pink_lower, pink_upper)
+            mask_white = cv2.inRange(hsv, white_lower, white_upper)
+            color_mask = cv2.bitwise_or(mask_red, cv2.bitwise_or(mask_pink, mask_white))
 
-            # Combine masks
-            combined_mask = cv2.bitwise_and(bowler_mask, pitch_mask)
+            # Subtract background color to reduce static red/pink objects
+            if bg_hsv is not None:
+                bg_color = cv2.bitwise_or(
+                    cv2.inRange(bg_hsv, red_lower1, red_upper1),
+                    cv2.inRange(bg_hsv, red_lower2, red_upper2)
+                )
+                bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, pink_lower, pink_upper))
+                bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, white_lower, white_upper))
+                # Dilate background mask to be safe
+                bg_color = cv2.dilate(bg_color, np.ones((5, 5), np.uint8), iterations=2)
+                color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(bg_color))
 
-            # Max ball size in pixels (ball appears ~0.5-2% of frame width)
-            max_ball_area = int(width * height * 0.003)
-            min_ball_area = 3
+            # Also detect via frame difference from background (catches any color ball)
+            if bg_model is not None:
+                diff = cv2.absdiff(frame, bg_model)
+                diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                _, motion_mask = cv2.threshold(diff_gray, 35, 255, cv2.THRESH_BINARY)
+                # Combine: pixels that are EITHER ball-colored OR moving (but must be on pitch)
+                combined = cv2.bitwise_or(color_mask, motion_mask)
+            else:
+                combined = color_mask
 
-            # Step 4: Process frames
-            target_frame = 0
-            while target_frame < total_frames:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            # Apply pitch mask
+            combined = cv2.bitwise_and(combined, pitch_mask)
 
-                time_s = target_frame / video_fps / slomo_factor
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            combined = cv2.erode(combined, kernel, iterations=1)
+            combined = cv2.dilate(combined, kernel, iterations=2)
 
-                if bg_model is not None:
-                    # Subtract background
-                    diff = cv2.absdiff(gray, bg_model)
-                    diff = cv2.bitwise_and(diff, combined_mask)
-                    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
-                    # Erode to remove noise, dilate to connect ball pixels
-                    kernel = np.ones((2, 2), np.uint8)
-                    thresh = cv2.erode(thresh, kernel, iterations=1)
-                    thresh = cv2.dilate(thresh, kernel, iterations=1)
+            # Find contours
+            contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    for cnt in contours:
-                        area = cv2.contourArea(cnt)
-                        if area < min_ball_area or area > max_ball_area:
-                            continue
-                        x, y, bw, bh = cv2.boundingRect(cnt)
-                        # Ball is roughly circular (aspect ratio < 2.5)
-                        aspect = max(bw, bh) / max(min(bw, bh), 1)
-                        if aspect > 2.5:
-                            continue
-                        cx = (x + bw / 2) / width
-                        cy = (y + bh / 2) / height
-                        raw_candidates.append({
-                            "frame": target_frame, "time": round(time_s, 4),
-                            "x": round(cx, 4), "y": round(cy, 4),
-                            "conf": round(min(1.0, area / 20), 2),
-                        })
+            frame_candidates = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_ball_area or area > max_ball_area:
+                    continue
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = max(bw, bh) / max(min(bw, bh), 1)
+                if aspect > 3.0:  # Ball is roundish
+                    continue
+                # Circularity check
+                perimeter = cv2.arcLength(cnt, True)
+                circularity = 4 * np.pi * area / max(perimeter * perimeter, 1)
+                cx = (x + bw / 2) / width
+                cy = (y + bh / 2) / height
+                # Score by circularity and color match strength
+                color_score = cv2.mean(color_mask[y:y+bh, x:x+bw])[0] / 255
+                score = circularity * 0.5 + color_score * 0.5
+                frame_candidates.append({
+                    "x": round(cx, 4), "y": round(cy, 4),
+                    "area": area, "score": round(score, 3),
+                    "circ": round(circularity, 2),
+                })
 
-                frames_done += 1
-                job["frames_done"] = frames_done
-                job["progress"] = round((frames_done / max(total_analysis, 1)) * 50)
-                target_frame += skip
+            # Keep best candidate per frame
+            if frame_candidates:
+                frame_candidates.sort(key=lambda c: c["score"], reverse=True)
+                best = frame_candidates[0]
+                raw_candidates.append({
+                    "frame": target_frame, "time": round(time_s, 4),
+                    "x": best["x"], "y": best["y"],
+                    "conf": best["score"],
+                })
+
+            frames_done += 1
+            job["frames_done"] = frames_done
+            job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
+            target_frame += skip
 
         cap.release()
-        print(f"Ball job {job_id}: {len(raw_candidates)} raw candidates")
+        print(f"Ball job {job_id}: {len(raw_candidates)} raw HSV candidates from {frames_done} frames")
 
-        # ═══ PASS 2: Filter trajectory — keep only positions forming a coherent path ═══
+        # ═══ STEP 3: Trajectory filtering ═══
         ball_positions = filter_ball_trajectory(raw_candidates, width, height)
 
         job["ball_positions"] = ball_positions
@@ -396,7 +381,7 @@ def process_ball_tracking(job_id):
         job["video_info"]["filtered_positions"] = len(ball_positions)
         job["status"] = "complete"
         job["progress"] = 100
-        print(f"Ball job {job_id}: {len(ball_positions)} filtered positions from {len(raw_candidates)} candidates ({job['video_info']['method']})")
+        print(f"Ball job {job_id}: {len(ball_positions)} trajectory points from {len(raw_candidates)} candidates")
 
     except Exception as e:
         job["status"] = "error"
@@ -570,26 +555,14 @@ def process_video(job_id):
 async def startup():
     global session, ball_session
     download_model()
-    print("Loading ONNX models...")
+    print("Loading ONNX pose model...")
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     print(f"Pose model loaded! Input: {session.get_inputs()[0].shape}")
-
-    if os.path.exists(BALL_MODEL_PATH) and os.path.getsize(BALL_MODEL_PATH) > 1000000:
-        try:
-            ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
-            print(f"Ball detection model loaded! Input: {ball_session.get_inputs()[0].shape}")
-        except Exception as e:
-            print(f"Ball model failed to load: {e}")
-            ball_session = None
-    else:
-        print("Ball detection model not available — will use frame-diff fallback")
-
-    # Warm up pose model
+    # Ball detection uses HSV color — no ML model needed
+    ball_session = None
     dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
     session.run(None, {session.get_inputs()[0].name: dummy})
-    if ball_session:
-        ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
-    print("Models warmed up!")
+    print("Model warmed up! Ball detection: HSV color mode")
     # Initialize Stripe (optional — works without it)
     if init_stripe():
         print("Stripe payment system ready")
