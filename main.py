@@ -177,21 +177,21 @@ def process_video(job_id):
         frames_done = 0
         input_name = session.get_inputs()[0].name
 
-        while True:
+        # Use seeking for high-fps videos (much faster than read-skip)
+        target_frame = 0
+        while target_frame < total_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             ret, frame = cap.read()
             if not ret:
                 break
-            if frame_idx % skip != 0:
-                frame_idx += 1
-                continue
 
-            time_s = frame_idx / video_fps
+            time_s = target_frame / video_fps
             blob, scale = preprocess(frame)
             outputs = session.run(None, {input_name: blob})
             landmarks, confidence = postprocess(outputs, scale)
 
             frames.append({
-                "frame": frame_idx,
+                "frame": target_frame,
                 "time": round(time_s, 4),
                 "keypoints": landmarks,
                 "confidence": confidence,
@@ -200,7 +200,7 @@ def process_video(job_id):
             frames_done += 1
             job["frames_done"] = frames_done
             job["progress"] = round((frames_done / max(total_analysis, 1)) * 100)
-            frame_idx += 1
+            target_frame += skip
 
         cap.release()
 
