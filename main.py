@@ -218,6 +218,7 @@ def process_ball_tracking(job_id):
     """Detect cricket ball using HSV color detection + contour analysis + trajectory fitting."""
     job = jobs[job_id]
     tmp_path = job["tmp_path"]
+    ball_color = job.get("ball_color", "red")
 
     try:
         slomo_factor = detect_slomo(tmp_path)
@@ -254,18 +255,22 @@ def process_ball_tracking(job_id):
         print(f"Ball job {job_id}: background model from {len(bg_frames)} frames")
 
         # ═══ STEP 2: Detect ball candidates in each frame ═══
-        # HSV ranges for cricket balls
-        # Red ball: two ranges (red wraps around in HSV)
-        red_lower1 = np.array([0, 70, 50])
-        red_upper1 = np.array([12, 255, 255])
-        red_lower2 = np.array([165, 70, 50])
-        red_upper2 = np.array([180, 255, 255])
-        # Pink ball
-        pink_lower = np.array([140, 30, 100])
-        pink_upper = np.array([170, 200, 255])
-        # White ball (high value, low saturation)
-        white_lower = np.array([0, 0, 200])
-        white_upper = np.array([180, 50, 255])
+        # HSV ranges based on selected ball color
+        hsv_ranges = {
+            'red': [
+                (np.array([0, 70, 50]), np.array([12, 255, 255])),
+                (np.array([165, 70, 50]), np.array([180, 255, 255])),
+            ],
+            'pink': [
+                (np.array([140, 30, 100]), np.array([175, 200, 255])),
+                (np.array([0, 40, 150]), np.array([10, 180, 255])),  # pinkish-red
+            ],
+            'white': [
+                (np.array([0, 0, 200]), np.array([180, 50, 255])),
+            ],
+        }
+        color_ranges = hsv_ranges.get(ball_color, hsv_ranges['red'])
+        print(f"Ball job {job_id}: detecting {ball_color} ball with {len(color_ranges)} HSV ranges")
 
         # Pitch-only mask: center strip of frame
         pitch_mask = np.zeros((height, width), dtype=np.uint8)
@@ -289,24 +294,16 @@ def process_ball_tracking(job_id):
             time_s = target_frame / video_fps / slomo_factor
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            # Color masks for ball
-            mask_red = cv2.bitwise_or(
-                cv2.inRange(hsv, red_lower1, red_upper1),
-                cv2.inRange(hsv, red_lower2, red_upper2)
-            )
-            mask_pink = cv2.inRange(hsv, pink_lower, pink_upper)
-            mask_white = cv2.inRange(hsv, white_lower, white_upper)
-            color_mask = cv2.bitwise_or(mask_red, cv2.bitwise_or(mask_pink, mask_white))
+            # Color mask for selected ball color
+            color_mask = np.zeros((height, width), dtype=np.uint8)
+            for lower, upper in color_ranges:
+                color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, lower, upper))
 
-            # Subtract background color to reduce static red/pink objects
+            # Subtract background color to reduce static colored objects
             if bg_hsv is not None:
-                bg_color = cv2.bitwise_or(
-                    cv2.inRange(bg_hsv, red_lower1, red_upper1),
-                    cv2.inRange(bg_hsv, red_lower2, red_upper2)
-                )
-                bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, pink_lower, pink_upper))
-                bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, white_lower, white_upper))
-                # Dilate background mask to be safe
+                bg_color = np.zeros((height, width), dtype=np.uint8)
+                for lower, upper in color_ranges:
+                    bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, lower, upper))
                 bg_color = cv2.dilate(bg_color, np.ones((5, 5), np.uint8), iterations=2)
                 color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(bg_color))
 
@@ -657,6 +654,7 @@ def get_results(job_id: str):
 @app.post("/detect-ball")
 async def detect_ball_video(
     video: UploadFile = File(...),
+    ball_color: str = Form("red"),
 ):
     """Upload video for ball tracking. Returns job_id — poll /ball-status/{job_id}."""
     cleanup_jobs()
@@ -674,6 +672,7 @@ async def detect_ball_video(
         "total_frames": 0,
         "created_at": time.time(),
         "tmp_path": tmp_path,
+        "ball_color": ball_color,
     }
 
     thread = threading.Thread(target=process_ball_tracking, args=(job_id,), daemon=True)
