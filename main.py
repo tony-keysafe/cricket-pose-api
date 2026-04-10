@@ -91,6 +91,10 @@ def detect_ball_roboflow(frame, conf_thresh=0.15):
                     h, w = frame.shape[:2]
                     detections = []
                     for pred in predictions:
+                        # CRITICAL: Only accept 'ball' class, reject 'stump' and others
+                        pred_class = pred.get("class", "").lower()
+                        if pred_class and pred_class != "ball":
+                            continue
                         cx = pred.get("x", 0)
                         cy = pred.get("y", 0)
                         conf = pred.get("confidence", 0)
@@ -343,6 +347,19 @@ def process_ball_tracking(job_id):
             ret, test_frame = cap.read()
             if ret:
                 test_result = detect_ball_roboflow(test_frame, conf_thresh=0.05)
+                # Also do a raw API call to see ALL classes being detected
+                _, test_enc = cv2.imencode('.jpg', test_frame)
+                try:
+                    test_resp = requests.post(ROBOFLOW_URL, params={"api_key": ROBOFLOW_API_KEY, "confidence": 5}, files={"file": ("test.jpg", test_enc.tobytes(), "image/jpeg")}, timeout=15)
+                    if test_resp.status_code == 200:
+                        all_preds = test_resp.json().get("predictions", [])
+                        from collections import Counter
+                        classes = Counter(p.get("class", "?") for p in all_preds)
+                        print(f"Ball job {job_id}: Roboflow test — ALL classes: {dict(classes)}")
+                        ball_only = [p for p in all_preds if p.get("class", "").lower() == "ball"]
+                        print(f"Ball job {job_id}: Roboflow test — {len(ball_only)} ball detections, {len(all_preds) - len(ball_only)} non-ball filtered out")
+                except Exception as te:
+                    print(f"Ball job {job_id}: test frame debug failed: {te}")
                 print(f"Ball job {job_id}: Roboflow test — {len(test_result)} detections on middle frame")
                 if test_result is None:
                     # API is broken, fall back
@@ -640,11 +657,17 @@ def filter_ball_trajectory(candidates, width, height):
             })
 
     # If still nothing, just return the largest group as-is
+    # BUT only if there's actual movement (not a static object like stumps)
     if not valid_deliveries and deliveries:
         largest = max(deliveries, key=len)
         transit = largest[-1]["time"] - largest[0]["time"]
-        if transit > 0 and len(largest) >= 2:
-            print(f"  Fallback: using largest group ({len(largest)} pts)")
+        y_vals_lg = [p["y"] for p in largest]
+        x_vals_lg = [p["x"] for p in largest]
+        y_span_lg = max(y_vals_lg) - min(y_vals_lg)
+        x_span_lg = max(x_vals_lg) - min(x_vals_lg)
+        total_movement = y_span_lg + x_span_lg
+        if transit > 0 and len(largest) >= 2 and total_movement > 0.03:
+            print(f"  Fallback: using largest group ({len(largest)} pts, movement={total_movement:.3f})")
             valid_deliveries.append({
                 "positions": largest,
                 "score": 1.0,
@@ -653,6 +676,8 @@ def filter_ball_trajectory(candidates, width, height):
                 "end_time": largest[-1]["time"],
                 "detections": len(largest),
             })
+        else:
+            print(f"  Fallback rejected: movement={total_movement:.3f} too small (likely static object like stumps)")
 
     valid_deliveries.sort(key=lambda d: d["score"], reverse=True)
     print(f"  Result: {len(valid_deliveries)} valid deliveries")
