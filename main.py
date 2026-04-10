@@ -170,24 +170,38 @@ def detect_slomo(path):
 
 
 def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
-    """Extract sports ball detections from YOLOv8 detection model output."""
+    """Extract ball detections — auto-detects custom 1-class model vs COCO 80-class."""
     predictions = output[0]
     if len(predictions.shape) == 3:
-        predictions = predictions[0].T  # (8400, 84) for COCO 80 classes
+        predictions = predictions[0].T
 
     if len(predictions) == 0:
         return []
 
-    # YOLOv8 detection format: [x_center, y_center, w, h, class0_conf, class1_conf, ...]
-    # COCO class 32 = sports ball
-    SPORTS_BALL_CLASS = 32
+    # Auto-detect model format from output shape
+    # YOLOv8/v11 detection: [x, y, w, h, class_scores...]
+    # COCO 80-class: 84 columns (4 box + 80 classes)
+    # Custom 1-class: 5 columns (4 box + 1 class)
+    num_cols = predictions.shape[1] if len(predictions.shape) == 2 else 0
     boxes = predictions[:, :4]
-    class_scores = predictions[:, 4:]  # 80 classes
 
-    if class_scores.shape[1] <= SPORTS_BALL_CLASS:
-        return []
+    if num_cols <= 6:
+        # Custom model: 1-2 classes — ball is class 0
+        ball_scores = predictions[:, 4]
+        print(f"Ball detection: custom model format ({num_cols} cols, 1-class)")
+    elif num_cols >= 84:
+        # COCO format: 80 classes, sports ball = class 32
+        SPORTS_BALL_CLASS = 32
+        class_scores = predictions[:, 4:]
+        if class_scores.shape[1] <= SPORTS_BALL_CLASS:
+            return []
+        ball_scores = class_scores[:, SPORTS_BALL_CLASS]
+        print(f"Ball detection: COCO format ({num_cols} cols, using class 32)")
+    else:
+        # Unknown format — try treating last column as score
+        ball_scores = predictions[:, 4] if num_cols > 4 else predictions[:, -1]
+        print(f"Ball detection: unknown format ({num_cols} cols, using col 4)")
 
-    ball_scores = class_scores[:, SPORTS_BALL_CLASS]
     mask = ball_scores > conf_thresh
     ball_boxes = boxes[mask]
     ball_confs = ball_scores[mask]
@@ -198,21 +212,18 @@ def postprocess_ball(output, scale, w, h, conf_thresh=0.15):
     detections = []
     for i in range(len(ball_boxes)):
         cx, cy, bw, bh = ball_boxes[i]
-        # Scale back to original image coordinates
         detections.append({
             "x": round(float(cx / scale), 1),
             "y": round(float(cy / scale), 1),
             "w": round(float(bw / scale), 1),
             "h": round(float(bh / scale), 1),
             "confidence": round(float(ball_confs[i]), 3),
-            # Normalized coordinates (0-1 range)
             "nx": round(float(cx / scale / w), 4),
             "ny": round(float(cy / scale / h), 4),
         })
 
-    # Sort by confidence, return best detection
     detections.sort(key=lambda d: d["confidence"], reverse=True)
-    return detections[:3]  # Top 3 candidates
+    return detections[:3]
 
 
 def process_ball_tracking(job_id):
@@ -663,6 +674,39 @@ async def analyze_video(
     thread.start()
 
     return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+
+@app.post("/upload-ball-model")
+async def upload_ball_model(
+    model: UploadFile = File(...),
+    api_key: str = Form("cricket2026"),
+):
+    """Upload a custom ONNX ball detection model. Requires api_key for security."""
+    global ball_session
+    if api_key != "cricket2026":
+        return JSONResponse(status_code=403, content={"error": "Invalid API key"})
+
+    content = await model.read()
+    if len(content) < 100000:
+        return JSONResponse(status_code=400, content={"error": f"Model file too small ({len(content)} bytes)"})
+
+    with open(BALL_MODEL_PATH, 'wb') as f:
+        f.write(content)
+
+    try:
+        ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
+        # Warm up
+        dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
+        ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
+        input_shape = ball_session.get_inputs()[0].shape
+        output_shape = ball_session.get_outputs()[0].shape
+        print(f"Custom ball model loaded! Input: {input_shape}, Output: {output_shape}")
+        return {"status": "ok", "message": "Ball model loaded successfully", "input_shape": str(input_shape), "output_shape": str(output_shape), "size_mb": round(len(content) / 1e6, 1)}
+    except Exception as e:
+        ball_session = None
+        if os.path.exists(BALL_MODEL_PATH):
+            os.remove(BALL_MODEL_PATH)
+        return JSONResponse(status_code=500, content={"error": f"Failed to load model: {str(e)}"})
 
 
 @app.get("/status/{job_id}")
