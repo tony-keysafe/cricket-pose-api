@@ -164,7 +164,7 @@ def detect_ball_roboflow(frame, conf_thresh=0.15):
             all_detections = unique
         
         all_detections.sort(key=lambda d: d["confidence"], reverse=True)
-        return all_detections[:3]
+        return all_detections[:5]
     except Exception as e:
         print(f"Roboflow detection error: {e}")
         return []
@@ -429,15 +429,17 @@ def process_ball_tracking(job_id):
                 time_s = target_frame / video_fps / slomo_factor
 
                 # Send FULL frame — tiling inside detect_ball_roboflow handles resolution
-                detections = detect_ball_roboflow(frame, conf_thresh=0.10)
+                detections = detect_ball_roboflow(frame, conf_thresh=0.08)
 
                 if detections:
-                    best = detections[0]
-                    raw_candidates.append({
-                        "frame": target_frame, "time": round(time_s, 4),
-                        "x": round(best["nx"], 4), "y": round(best["ny"], 4),
-                        "conf": best["confidence"],
-                    })
+                    # Collect ALL detections, not just the best — the real ball might
+                    # have lower confidence than a static false positive (stump, net mark)
+                    for det in detections:
+                        raw_candidates.append({
+                            "frame": target_frame, "time": round(time_s, 4),
+                            "x": round(det["nx"], 4), "y": round(det["ny"], 4),
+                            "conf": det["confidence"],
+                        })
                 frames_done += 1
                 job["frames_done"] = frames_done
                 job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
@@ -446,23 +448,38 @@ def process_ball_tracking(job_id):
                     print(f"Ball job {job_id}: {frames_done}/{total_analysis} frames, {len(raw_candidates)} detections so far")
 
             cap.release()
-            print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} candidates in {frames_done} frames")
+            print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} total detections in {frames_done} frames")
 
             # Log all detection positions for debugging
             if raw_candidates:
-                for i, c in enumerate(raw_candidates[:5]):
+                for i, c in enumerate(raw_candidates[:10]):
                     print(f"Ball job {job_id}: detection {i}: frame={c['frame']} x={c['x']:.3f} y={c['y']:.3f} conf={c['conf']:.3f}")
 
-            # ═══ REJECT STATIC FALSE POSITIVES ═══
+            # ═══ SEPARATE STATIC FALSE POSITIVES FROM MOVING BALL ═══
+            # Static objects (stumps, net marks) appear at the same position in every frame.
+            # The real ball moves. Cluster detections by position, remove the static cluster.
             if len(raw_candidates) >= 3:
-                xs = [c["x"] for c in raw_candidates]
-                ys = [c["y"] for c in raw_candidates]
-                x_std = float(np.std(xs))
-                y_std = float(np.std(ys))
-                print(f"Ball job {job_id}: position spread — x_std={x_std:.4f}, y_std={y_std:.4f}")
-                if x_std < 0.015 and y_std < 0.015:
-                    print(f"Ball job {job_id}: REJECTED all {len(raw_candidates)} detections — static object (not a moving ball)")
-                    raw_candidates = []
+                # Find position clusters using simple grid
+                from collections import defaultdict
+                grid = defaultdict(list)
+                for i, c in enumerate(raw_candidates):
+                    # Grid cells of 3% of frame
+                    gx = round(c["x"] / 0.03)
+                    gy = round(c["y"] / 0.03)
+                    grid[(gx, gy)].append(i)
+                
+                # Any grid cell with >40% of all detections is likely a static object
+                static_indices = set()
+                threshold = len(raw_candidates) * 0.4
+                for cell, indices in grid.items():
+                    if len(indices) >= threshold:
+                        print(f"Ball job {job_id}: STATIC cluster at ({cell[0]*0.03:.2f}, {cell[1]*0.03:.2f}) — {len(indices)} detections (removing)")
+                        static_indices.update(indices)
+                
+                if static_indices:
+                    moving = [c for i, c in enumerate(raw_candidates) if i not in static_indices]
+                    print(f"Ball job {job_id}: Removed {len(static_indices)} static detections, {len(moving)} remaining")
+                    raw_candidates = moving
 
         # ═══ SECONDARY: Local ONNX model ═══
         elif use_ml:
