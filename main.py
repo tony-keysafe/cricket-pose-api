@@ -319,8 +319,8 @@ def process_ball_tracking(job_id):
         use_ml = ball_session is not None
         use_roboflow = bool(ROBOFLOW_API_KEY)
         if use_roboflow:
-            # Target ~15 frames per second of real time (enough for trajectory)
-            skip = max(1, int(video_fps * slomo_factor / 15))
+            # Target ~30 frames per second of real time for good trajectory resolution
+            skip = max(1, int(video_fps * slomo_factor / 30))
         else:
             skip = max(1, int(video_fps / 60))
         total_analysis = total_frames // skip
@@ -377,7 +377,7 @@ def process_ball_tracking(job_id):
                 if not ret:
                     break
                 time_s = target_frame / video_fps / slomo_factor
-                detections = detect_ball_roboflow(frame, conf_thresh=0.15)
+                detections = detect_ball_roboflow(frame, conf_thresh=0.08)
                 if detections:
                     best = detections[0]
                     raw_candidates.append({
