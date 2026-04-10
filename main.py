@@ -370,6 +370,12 @@ def process_ball_tracking(job_id):
 
         if use_roboflow:
             print(f"Ball job {job_id}: processing {total_analysis} frames via Roboflow API (skip={skip})")
+
+            # Crop frames to pitch area — makes ball appear larger for better detection
+            crop_x1 = int(width * 0.20)
+            crop_x2 = int(width * 0.80)
+            crop_w = crop_x2 - crop_x1
+
             target_frame = 0
             while target_frame < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
@@ -377,24 +383,42 @@ def process_ball_tracking(job_id):
                 if not ret:
                     break
                 time_s = target_frame / video_fps / slomo_factor
-                detections = detect_ball_roboflow(frame, conf_thresh=0.08)
+
+                # Crop to pitch strip and send to Roboflow
+                cropped = frame[:, crop_x1:crop_x2]
+                detections = detect_ball_roboflow(cropped, conf_thresh=0.20)
+
                 if detections:
                     best = detections[0]
+                    # Map cropped coordinates back to full frame
+                    full_x = (best["nx"] * crop_w + crop_x1) / width
+                    full_y = best["ny"]
                     raw_candidates.append({
                         "frame": target_frame, "time": round(time_s, 4),
-                        "x": best["nx"], "y": best["ny"],
+                        "x": round(full_x, 4), "y": round(full_y, 4),
                         "conf": best["confidence"],
                     })
                 frames_done += 1
                 job["frames_done"] = frames_done
                 job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
                 target_frame += skip
-                # Log progress every 20 frames
                 if frames_done % 20 == 0:
                     print(f"Ball job {job_id}: {frames_done}/{total_analysis} frames, {len(raw_candidates)} detections so far")
 
             cap.release()
             print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} candidates in {frames_done} frames")
+
+            # ═══ REJECT STATIC FALSE POSITIVES ═══
+            # Real ball moves across the frame; static objects (stumps, net marks) don't
+            if len(raw_candidates) >= 3:
+                xs = [c["x"] for c in raw_candidates]
+                ys = [c["y"] for c in raw_candidates]
+                x_std = float(np.std(xs))
+                y_std = float(np.std(ys))
+                print(f"Ball job {job_id}: position spread — x_std={x_std:.4f}, y_std={y_std:.4f}")
+                if x_std < 0.02 and y_std < 0.02:
+                    print(f"Ball job {job_id}: REJECTED all {len(raw_candidates)} detections — static object (not a moving ball)")
+                    raw_candidates = []
 
         # ═══ SECONDARY: Local ONNX model ═══
         elif use_ml:
