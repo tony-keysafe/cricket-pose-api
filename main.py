@@ -877,13 +877,13 @@ def process_video(job_id):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Skip frames: target ~30 analysis frames per second of REAL TIME
-        # For normal video: skip based on video fps
-        # For slo-mo: increase skip so effective real-time fps is ~30
-        target_real_fps = 30
+        # Skip frames: target ~60 analysis frames per second of REAL TIME
+        # This balances two competing needs:
+        # - Lower real fps = less keypoint jitter noise (skip=8 → 30fps: too few frames for stride/BFC)
+        # - Higher real fps = more frames around events (skip=2 → 120fps: jitter dominates speed)
+        # Compromise: ~60 real fps → 16ms gaps → SNR ~2.4 for speed, enough frames for events
+        target_real_fps = 60
         if slomo_factor > 1:
-            # Slo-mo: adjust skip to get ~30 real-time fps
-            # e.g. 30fps video, 8x slo-mo: skip = 30*8/30 = 8
             skip = max(1, int(video_fps * slomo_factor / target_real_fps))
             print(f"Slo-mo skip adjustment: video={video_fps}fps, factor={slomo_factor}x → skip={skip} → {video_fps/skip:.1f} video fps = {video_fps/skip*slomo_factor:.0f} real fps")
         elif video_fps <= 30:
