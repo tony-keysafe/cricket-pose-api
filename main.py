@@ -889,8 +889,16 @@ def process_video(job_id):
     fps_hint = job["fps"]
 
     try:
-        # Detect slo-mo before opening with OpenCV
-        slomo_factor = detect_slomo(tmp_path)
+        # Use user's Video Type selection as slo-mo override
+        # fps_hint = 30 (normal), 120 (slo-mo 4x), 240 (slo-mo 8x)
+        override_factor = None
+        if fps_hint and fps_hint > 30:
+            # User explicitly selected slo-mo mode
+            # Video file is 30fps display, native capture was fps_hint
+            override_factor = fps_hint / 30
+            print(f"User selected {fps_hint}fps → override slo-mo factor to {override_factor}x")
+        
+        slomo_factor = detect_slomo(tmp_path, override_factor=override_factor)
         print(f"Slo-mo detection: factor={slomo_factor}")
 
         cap = cv2.VideoCapture(tmp_path)
