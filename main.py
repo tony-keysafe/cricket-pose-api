@@ -758,6 +758,22 @@ def filter_ball_trajectory(candidates, width, height):
         if len(delivery) < 2:
             continue
 
+        # ═══ RELEASE POINT DETECTION ═══
+        # From behind stumps: ball-in-hand moves UPWARD (Y decreasing) as arm goes over.
+        # After release, ball moves DOWNWARD (Y increasing) towards camera.
+        # Find the direction change point and trim everything before it.
+        if len(delivery) >= 3:
+            y_vals_raw = [p["y"] for p in delivery]
+            # Find the minimum Y point (highest in frame = top of bowling arc)
+            min_y_idx = y_vals_raw.index(min(y_vals_raw))
+            # If the minimum Y is not at the start, there are ball-in-hand detections
+            if min_y_idx > 0 and min_y_idx < len(delivery) - 1:
+                # Trim everything before the release (min Y point)
+                trimmed = delivery[min_y_idx:]
+                if len(trimmed) >= 2:
+                    print(f"  Group {idx}: release detected at idx {min_y_idx} (y={y_vals_raw[min_y_idx]:.3f}), trimmed {min_y_idx} ball-in-hand detections")
+                    delivery = trimmed
+
         y_vals = [p["y"] for p in delivery]
         x_vals = [p["x"] for p in delivery]
 
