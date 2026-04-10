@@ -914,13 +914,6 @@ def process_video(job_id):
             skip = 12
         
         print(f"Frame sampling: video={video_fps}fps, slomo={slomo_factor}x, skip={skip} → {video_fps/skip:.1f} video fps = {video_fps/skip*slomo_factor:.0f} real fps")
-            skip = 2
-        elif video_fps <= 60:
-            skip = 3
-        elif video_fps <= 120:
-            skip = 6
-        else:
-            skip = 12
 
         analysis_fps = video_fps / skip
         total_analysis = total_frames // skip
