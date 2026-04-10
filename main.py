@@ -568,29 +568,51 @@ def process_ball_tracking(job_id):
 def filter_ball_trajectory(candidates, width, height):
     """Filter raw candidates to find ball trajectories.
     Returns ALL valid deliveries, scored and sorted by quality."""
-    if len(candidates) < 3:
+    if len(candidates) < 2:
         return {"deliveries": [], "all_positions": candidates}
+
+    # Log candidate distribution for debugging
+    times = [c["time"] for c in candidates]
+    print(f"Trajectory filter: {len(candidates)} candidates, time range {min(times):.3f}s - {max(times):.3f}s")
+    if len(candidates) >= 2:
+        gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
+        print(f"  Time gaps: min={min(gaps):.3f}s, max={max(gaps):.3f}s, median={sorted(gaps)[len(gaps)//2]:.3f}s")
+        ys = [c["y"] for c in candidates]
+        print(f"  Y range: {min(ys):.3f} - {max(ys):.3f} (span {max(ys)-min(ys):.3f})")
+
+    # Adaptive gap threshold: use 3× the median gap between detections
+    if len(candidates) >= 3:
+        gaps = sorted([times[i+1] - times[i] for i in range(len(times)-1)])
+        median_gap = gaps[len(gaps)//2]
+        gap_threshold = max(0.3, min(2.0, median_gap * 3))
+    else:
+        gap_threshold = 1.0
+    print(f"  Gap threshold: {gap_threshold:.3f}s")
 
     # Group candidates by time into potential deliveries
     deliveries = []
     current = [candidates[0]]
     for i in range(1, len(candidates)):
         time_gap = candidates[i]["time"] - candidates[i - 1]["time"]
-        if time_gap > 0.15:  # Gap > 150ms = new delivery or noise
-            if len(current) >= 3:
+        if time_gap > gap_threshold:
+            if len(current) >= 2:
                 deliveries.append(current)
             current = []
         current.append(candidates[i])
-    if len(current) >= 3:
+    if len(current) >= 2:
         deliveries.append(current)
 
+    print(f"  Grouped into {len(deliveries)} potential deliveries: {[len(d) for d in deliveries]}")
+
     if not deliveries:
-        return {"deliveries": [], "all_positions": candidates}
+        # If grouping failed, treat ALL candidates as one delivery
+        print(f"  No groups found, treating all {len(candidates)} as one delivery")
+        deliveries = [candidates]
 
     # Score and filter each delivery
     valid_deliveries = []
-    for delivery in deliveries:
-        if len(delivery) < 3:
+    for idx, delivery in enumerate(deliveries):
+        if len(delivery) < 2:
             continue
 
         y_vals = [p["y"] for p in delivery]
@@ -601,10 +623,13 @@ def filter_ball_trajectory(candidates, width, height):
         x_range = max(x_vals) - min(x_vals)
         y_span = max(y_vals) - min(y_vals)
 
-        score = y_span * y_ratio * len(delivery) / max(x_range * 10, 0.1)
+        score = y_span * max(y_ratio, 0.3) * len(delivery) / max(x_range * 10, 0.1)
+        transit = delivery[-1]["time"] - delivery[0]["time"]
 
-        if y_ratio > 0.4 and y_span > 0.05:
-            transit = delivery[-1]["time"] - delivery[0]["time"]
+        print(f"  Group {idx}: {len(delivery)} pts, y_span={y_span:.3f}, y_ratio={y_ratio:.2f}, x_range={x_range:.3f}, transit={transit:.3f}s, score={score:.2f}")
+
+        # Relaxed criteria: just need some vertical movement and reasonable transit time
+        if y_span > 0.02 and transit > 0.02 and transit < 5.0:
             valid_deliveries.append({
                 "positions": delivery,
                 "score": round(score, 2),
@@ -614,7 +639,23 @@ def filter_ball_trajectory(candidates, width, height):
                 "detections": len(delivery),
             })
 
+    # If still nothing, just return the largest group as-is
+    if not valid_deliveries and deliveries:
+        largest = max(deliveries, key=len)
+        transit = largest[-1]["time"] - largest[0]["time"]
+        if transit > 0 and len(largest) >= 2:
+            print(f"  Fallback: using largest group ({len(largest)} pts)")
+            valid_deliveries.append({
+                "positions": largest,
+                "score": 1.0,
+                "transit_time": round(transit, 4),
+                "start_time": largest[0]["time"],
+                "end_time": largest[-1]["time"],
+                "detections": len(largest),
+            })
+
     valid_deliveries.sort(key=lambda d: d["score"], reverse=True)
+    print(f"  Result: {len(valid_deliveries)} valid deliveries")
     return {"deliveries": valid_deliveries, "all_positions": candidates}
 
 
