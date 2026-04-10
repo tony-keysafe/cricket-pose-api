@@ -407,16 +407,17 @@ def process_ball_tracking(job_id):
             cap.release()
             print(f"Ball job {job_id}: {len(raw_candidates)} raw HSV candidates from {frames_done} frames")
 
-        # ═══ STEP 3: Trajectory filtering ═══
-        ball_positions = filter_ball_trajectory(raw_candidates, width, height)
+        # ═══ Trajectory filtering ═══
+        result = filter_ball_trajectory(raw_candidates, width, height)
 
-        job["ball_positions"] = ball_positions
+        job["ball_positions"] = result.get("all_positions", [])
+        job["deliveries"] = result.get("deliveries", [])
         job["video_info"]["frames_analyzed"] = frames_done
         job["video_info"]["raw_candidates"] = len(raw_candidates)
-        job["video_info"]["filtered_positions"] = len(ball_positions)
+        job["video_info"]["deliveries_found"] = len(result.get("deliveries", []))
         job["status"] = "complete"
         job["progress"] = 100
-        print(f"Ball job {job_id}: {len(ball_positions)} trajectory points from {len(raw_candidates)} candidates")
+        print(f"Ball job {job_id}: {len(result.get('deliveries', []))} deliveries from {len(raw_candidates)} candidates")
 
     except Exception as e:
         job["status"] = "error"
@@ -433,13 +434,12 @@ def process_ball_tracking(job_id):
 
 
 def filter_ball_trajectory(candidates, width, height):
-    """Filter raw candidates to find the most likely ball trajectory.
-    Ball should form a roughly straight/parabolic path from top to bottom."""
+    """Filter raw candidates to find ball trajectories.
+    Returns ALL valid deliveries, scored and sorted by quality."""
     if len(candidates) < 3:
-        return candidates
+        return {"deliveries": [], "all_positions": candidates}
 
     # Group candidates by time into potential deliveries
-    # A delivery takes ~0.3-1.0 seconds in real time
     deliveries = []
     current = [candidates[0]]
     for i in range(1, len(candidates)):
@@ -453,38 +453,37 @@ def filter_ball_trajectory(candidates, width, height):
         deliveries.append(current)
 
     if not deliveries:
-        return []
+        return {"deliveries": [], "all_positions": candidates}
 
-    # Score each potential delivery by trajectory smoothness
-    best_delivery = None
-    best_score = -1
-
+    # Score and filter each delivery
+    valid_deliveries = []
     for delivery in deliveries:
         if len(delivery) < 3:
             continue
 
-        # Ball should move mostly downward (Y increases) and stay roughly centered
         y_vals = [p["y"] for p in delivery]
         x_vals = [p["x"] for p in delivery]
 
-        # Check Y is generally increasing (ball moving towards camera)
         y_increasing = sum(1 for i in range(1, len(y_vals)) if y_vals[i] > y_vals[i-1])
         y_ratio = y_increasing / max(len(y_vals) - 1, 1)
-
-        # Check X stays within reasonable lateral range (ball doesn't zig-zag wildly)
         x_range = max(x_vals) - min(x_vals)
-
-        # Trajectory span (should cover significant portion of frame)
         y_span = max(y_vals) - min(y_vals)
 
-        # Score: prefer long, smooth, downward trajectories
         score = y_span * y_ratio * len(delivery) / max(x_range * 10, 0.1)
 
-        if score > best_score and y_ratio > 0.5 and y_span > 0.1:
-            best_score = score
-            best_delivery = delivery
+        if y_ratio > 0.4 and y_span > 0.05:
+            transit = delivery[-1]["time"] - delivery[0]["time"]
+            valid_deliveries.append({
+                "positions": delivery,
+                "score": round(score, 2),
+                "transit_time": round(transit, 4),
+                "start_time": delivery[0]["time"],
+                "end_time": delivery[-1]["time"],
+                "detections": len(delivery),
+            })
 
-    return best_delivery or []
+    valid_deliveries.sort(key=lambda d: d["score"], reverse=True)
+    return {"deliveries": valid_deliveries, "all_positions": candidates}
 
 
 def process_video(job_id):
@@ -760,6 +759,7 @@ def get_ball_results(job_id: str):
     return JSONResponse(content={
         "video_info": job.get("video_info", {}),
         "ball_positions": job.get("ball_positions", []),
+        "deliveries": job.get("deliveries", []),
     })
 
 
