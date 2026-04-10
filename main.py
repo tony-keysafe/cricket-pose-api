@@ -58,65 +58,113 @@ ROBOFLOW_URLS = [
 ROBOFLOW_URL = ROBOFLOW_URLS[0]  # Will be updated on first successful call
 
 
-def detect_ball_roboflow(frame, conf_thresh=0.15):
-    """Detect cricket ball using Roboflow hosted API. Tries multiple endpoints."""
+def detect_ball_roboflow_single(tile, conf_thresh=0.15):
+    """Send a single image tile to Roboflow and return raw predictions."""
     global ROBOFLOW_URL
+    _, img_encoded = cv2.imencode('.jpg', tile, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    img_bytes = img_encoded.tobytes()
+
+    urls_to_try = [ROBOFLOW_URL] + [u for u in ROBOFLOW_URLS if u != ROBOFLOW_URL]
+    for url in urls_to_try:
+        try:
+            resp = requests.post(
+                url,
+                params={
+                    "api_key": ROBOFLOW_API_KEY,
+                    "confidence": int(conf_thresh * 100),
+                    "overlap": 30,
+                },
+                files={"file": ("frame.jpg", img_bytes, "image/jpeg")},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                if url != ROBOFLOW_URL:
+                    print(f"Roboflow: switching to working URL: {url}")
+                    ROBOFLOW_URL = url
+                return resp.json().get("predictions", [])
+            else:
+                print(f"Roboflow {url}: HTTP {resp.status_code}")
+        except requests.exceptions.Timeout:
+            print(f"Roboflow {url}: timeout")
+        except Exception as e:
+            print(f"Roboflow {url}: {e}")
+    return []
+
+
+def detect_ball_roboflow(frame, conf_thresh=0.15):
+    """Detect cricket ball using TILED approach for tall portrait frames.
+    
+    YOLO resizes input to 640x640. A 1080x1920 portrait frame gets compressed 3x vertically,
+    making a 15px ball into 5px — undetectable. Tiling keeps the ball at detectable size.
+    """
     try:
-        _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        img_bytes = img_encoded.tobytes()
-
-        # Try current URL first, then fall back to alternatives
-        urls_to_try = [ROBOFLOW_URL] + [u for u in ROBOFLOW_URLS if u != ROBOFLOW_URL]
-
-        for url in urls_to_try:
-            try:
-                resp = requests.post(
-                    url,
-                    params={
-                        "api_key": ROBOFLOW_API_KEY,
-                        "confidence": int(conf_thresh * 100),
-                        "overlap": 30,
-                    },
-                    files={"file": ("frame.jpg", img_bytes, "image/jpeg")},
-                    timeout=15,
-                )
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    predictions = data.get("predictions", [])
-                    if url != ROBOFLOW_URL:
-                        print(f"Roboflow: switching to working URL: {url}")
-                        ROBOFLOW_URL = url
-
-                    h, w = frame.shape[:2]
-                    detections = []
-                    for pred in predictions:
-                        # CRITICAL: Only accept 'ball' class, reject 'stump' and others
-                        pred_class = pred.get("class", "").lower()
-                        if pred_class and pred_class != "ball":
-                            continue
-                        cx = pred.get("x", 0)
-                        cy = pred.get("y", 0)
-                        conf = pred.get("confidence", 0)
-                        detections.append({
-                            "nx": round(cx / w, 4),
-                            "ny": round(cy / h, 4),
-                            "confidence": round(conf, 3),
-                            "x": round(cx, 1),
-                            "y": round(cy, 1),
-                            "w": round(pred.get("width", 0), 1),
-                            "h": round(pred.get("height", 0), 1),
-                        })
-                    detections.sort(key=lambda d: d["confidence"], reverse=True)
-                    return detections[:3]
-                else:
-                    print(f"Roboflow {url}: HTTP {resp.status_code} — {resp.text[:200]}")
-            except requests.exceptions.Timeout:
-                print(f"Roboflow {url}: timeout")
-            except Exception as e:
-                print(f"Roboflow {url}: {e}")
-
-        return []
+        full_h, full_w = frame.shape[:2]
+        
+        # Decide if tiling is needed: if height > 1.5x width, tile vertically
+        if full_h > full_w * 1.5:
+            # Create overlapping horizontal strips
+            # Each tile should be roughly square for best YOLO performance
+            tile_h = full_w  # make tiles square-ish
+            overlap = tile_h // 3  # 33% overlap to catch ball on tile boundaries
+            
+            tiles = []
+            y = 0
+            while y < full_h:
+                y_end = min(y + tile_h, full_h)
+                # Don't create tiny leftover tiles
+                if full_h - y_end < tile_h // 3 and y > 0:
+                    y_end = full_h
+                tiles.append((y, y_end))
+                if y_end >= full_h:
+                    break
+                y += tile_h - overlap
+        else:
+            # Frame is already roughly square, send as-is
+            tiles = [(0, full_h)]
+        
+        all_detections = []
+        for tile_y1, tile_y2 in tiles:
+            tile = frame[tile_y1:tile_y2, :]
+            preds = detect_ball_roboflow_single(tile, conf_thresh)
+            
+            tile_h_actual = tile_y2 - tile_y1
+            for pred in preds:
+                pred_class = pred.get("class", "").lower()
+                if pred_class and pred_class != "ball":
+                    continue
+                # Map tile coordinates back to full frame
+                cx = pred.get("x", 0)
+                cy = pred.get("y", 0) + tile_y1  # offset by tile position
+                conf = pred.get("confidence", 0)
+                all_detections.append({
+                    "nx": round(cx / full_w, 4),
+                    "ny": round(cy / full_h, 4),
+                    "confidence": round(conf, 3),
+                    "x": round(cx, 1),
+                    "y": round(cy, 1),
+                    "w": round(pred.get("width", 0), 1),
+                    "h": round(pred.get("height", 0), 1),
+                })
+        
+        # Deduplicate detections from overlapping tiles (same ball detected in 2 tiles)
+        if len(all_detections) > 1:
+            unique = [all_detections[0]]
+            for det in all_detections[1:]:
+                is_dup = False
+                for u in unique:
+                    if abs(det["nx"] - u["nx"]) < 0.03 and abs(det["ny"] - u["ny"]) < 0.03:
+                        # Keep higher confidence
+                        if det["confidence"] > u["confidence"]:
+                            unique.remove(u)
+                            unique.append(det)
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique.append(det)
+            all_detections = unique
+        
+        all_detections.sort(key=lambda d: d["confidence"], reverse=True)
+        return all_detections[:3]
     except Exception as e:
         print(f"Roboflow detection error: {e}")
         return []
@@ -369,12 +417,8 @@ def process_ball_tracking(job_id):
                     job["video_info"]["method"] = method
 
         if use_roboflow:
-            print(f"Ball job {job_id}: processing {total_analysis} frames via Roboflow API (skip={skip})")
-
-            # Crop frames to pitch area — makes ball appear larger for better detection
-            crop_x1 = int(width * 0.20)
-            crop_x2 = int(width * 0.80)
-            crop_w = crop_x2 - crop_x1
+            print(f"Ball job {job_id}: processing {total_analysis} frames via Roboflow API with TILING (skip={skip})")
+            print(f"Ball job {job_id}: frame size {width}x{height} — will tile into ~{max(1, height // width)} strips for better detection")
 
             target_frame = 0
             while target_frame < total_frames:
@@ -384,18 +428,14 @@ def process_ball_tracking(job_id):
                     break
                 time_s = target_frame / video_fps / slomo_factor
 
-                # Crop to pitch strip and send to Roboflow
-                cropped = frame[:, crop_x1:crop_x2]
-                detections = detect_ball_roboflow(cropped, conf_thresh=0.20)
+                # Send FULL frame — tiling inside detect_ball_roboflow handles resolution
+                detections = detect_ball_roboflow(frame, conf_thresh=0.10)
 
                 if detections:
                     best = detections[0]
-                    # Map cropped coordinates back to full frame
-                    full_x = (best["nx"] * crop_w + crop_x1) / width
-                    full_y = best["ny"]
                     raw_candidates.append({
                         "frame": target_frame, "time": round(time_s, 4),
-                        "x": round(full_x, 4), "y": round(full_y, 4),
+                        "x": round(best["nx"], 4), "y": round(best["ny"], 4),
                         "conf": best["confidence"],
                     })
                 frames_done += 1
@@ -408,15 +448,19 @@ def process_ball_tracking(job_id):
             cap.release()
             print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} candidates in {frames_done} frames")
 
+            # Log all detection positions for debugging
+            if raw_candidates:
+                for i, c in enumerate(raw_candidates[:5]):
+                    print(f"Ball job {job_id}: detection {i}: frame={c['frame']} x={c['x']:.3f} y={c['y']:.3f} conf={c['conf']:.3f}")
+
             # ═══ REJECT STATIC FALSE POSITIVES ═══
-            # Real ball moves across the frame; static objects (stumps, net marks) don't
             if len(raw_candidates) >= 3:
                 xs = [c["x"] for c in raw_candidates]
                 ys = [c["y"] for c in raw_candidates]
                 x_std = float(np.std(xs))
                 y_std = float(np.std(ys))
                 print(f"Ball job {job_id}: position spread — x_std={x_std:.4f}, y_std={y_std:.4f}")
-                if x_std < 0.02 and y_std < 0.02:
+                if x_std < 0.015 and y_std < 0.015:
                     print(f"Ball job {job_id}: REJECTED all {len(raw_candidates)} detections — static object (not a moving ball)")
                     raw_candidates = []
 
