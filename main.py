@@ -944,6 +944,118 @@ def process_video(job_id):
 
         cap.release()
 
+        # ═══ DIAGNOSTIC OUTPUT ═══
+        # Trace actual data at each pipeline step
+        valid_frames = [f for f in frames if f["keypoints"] is not None]
+        print(f"\n{'='*60}")
+        print(f"PIPELINE DIAGNOSTIC — Job {job_id}")
+        print(f"{'='*60}")
+        print(f"Step 1 - Video: {width}×{height}, {video_fps}fps, {total_frames} frames, slomo={slomo_factor}x")
+        print(f"Step 2 - Sampling: skip={skip}, analyzed={len(frames)}, valid={len(valid_frames)} ({100*len(valid_frames)//max(len(frames),1)}%)")
+        print(f"Step 3 - Model input: {width}×{height} → scale={min(640/width, 640/height):.3f} → {int(width*min(640/width,640/height))}×{int(height*min(640/width,640/height))} padded to 640×640")
+        
+        # Step 4: Sample actual keypoint values
+        if len(valid_frames) >= 5:
+            sample_indices = [0, len(valid_frames)//4, len(valid_frames)//2, 3*len(valid_frames)//4, len(valid_frames)-1]
+            print(f"\nStep 4 - Sample keypoints (5 frames across video):")
+            for si in sample_indices:
+                f = valid_frames[si]
+                kp = f["keypoints"]
+                # Left hip (23), Right hip (24), Left ankle (27), Right ankle (28), Right wrist (16)
+                hip_l = kp[23] if kp[23] else None
+                hip_r = kp[24] if kp[24] else None
+                ank_l = kp[27] if kp[27] else None
+                ank_r = kp[28] if kp[28] else None
+                wrist_r = kp[16] if kp[16] else None
+                wrist_l = kp[15] if kp[15] else None
+                hip_mid = None
+                if hip_l and hip_r:
+                    hip_mid = ((hip_l["x"]+hip_r["x"])/2, (hip_l["y"]+hip_r["y"])/2)
+                
+                print(f"  Frame {f['frame']} (t={f['time']:.3f}s, conf={f['confidence']:.2f}):")
+                if hip_mid:
+                    print(f"    Hip mid: ({hip_mid[0]:.1f}, {hip_mid[1]:.1f})")
+                if hip_l:
+                    print(f"    L.Hip: ({hip_l['x']:.1f}, {hip_l['y']:.1f}) vis={hip_l['visibility']:.2f}")
+                if ank_l:
+                    print(f"    L.Ankle: ({ank_l['x']:.1f}, {ank_l['y']:.1f}) vis={ank_l['visibility']:.2f}")
+                if ank_r:
+                    print(f"    R.Ankle: ({ank_r['x']:.1f}, {ank_r['y']:.1f}) vis={ank_r['visibility']:.2f}")
+                if wrist_r:
+                    print(f"    R.Wrist: ({wrist_r['x']:.1f}, {wrist_r['y']:.1f}) vis={wrist_r['visibility']:.2f}")
+            
+            # Step 5: Frame-to-frame hip displacement (first 10 consecutive valid frames)
+            print(f"\nStep 5 - Hip displacement between consecutive frames:")
+            for i in range(1, min(11, len(valid_frames))):
+                prev_f = valid_frames[i-1]
+                curr_f = valid_frames[i]
+                ph = prev_f["keypoints"]
+                ch = curr_f["keypoints"]
+                if ph[23] and ph[24] and ch[23] and ch[24]:
+                    px = (ph[23]["x"]+ph[24]["x"])/2
+                    py = (ph[23]["y"]+ph[24]["y"])/2
+                    cx = (ch[23]["x"]+ch[24]["x"])/2
+                    cy = (ch[23]["y"]+ch[24]["y"])/2
+                    dx = cx - px
+                    dy = cy - py
+                    dist = (dx**2 + dy**2)**0.5
+                    dt = curr_f["time"] - prev_f["time"]
+                    speed_px_s = dist / dt if dt > 0 else 0
+                    print(f"  Frame {prev_f['frame']}→{curr_f['frame']}: dx={dx:.1f} dy={dy:.1f} dist={dist:.1f}px dt={dt*1000:.1f}ms → {speed_px_s:.0f}px/s")
+            
+            # Step 6: Ankle positions around likely delivery (max stride)
+            max_stride_px = 0
+            max_stride_idx = 0
+            for i, f in enumerate(valid_frames):
+                kp = f["keypoints"]
+                if kp[27] and kp[28] and kp[27]["visibility"] > 0.2 and kp[28]["visibility"] > 0.2:
+                    stride = abs(kp[27]["x"] - kp[28]["x"])
+                    if stride > max_stride_px:
+                        max_stride_px = stride
+                        max_stride_idx = i
+            
+            print(f"\nStep 6 - Max stride detection:")
+            print(f"  Max ankle X separation: {max_stride_px:.1f}px at frame {valid_frames[max_stride_idx]['frame']}")
+            # Show ankle positions around max stride
+            for di in range(-3, 4):
+                idx = max_stride_idx + di
+                if 0 <= idx < len(valid_frames):
+                    f = valid_frames[idx]
+                    kp = f["keypoints"]
+                    la = kp[27]
+                    ra = kp[28]
+                    sep = abs(la["x"] - ra["x"]) if la and ra else 0
+                    print(f"  [{'+' if di>0 else ''}{di}] Frame {f['frame']} t={f['time']:.3f}s: L.Ank=({la['x']:.0f},{la['y']:.0f}) R.Ank=({ra['x']:.0f},{ra['y']:.0f}) sep={sep:.0f}px" if la and ra else f"  [{'+' if di>0 else ''}{di}] Frame {f['frame']}: ankle data missing")
+
+            # Step 7: Bowler apparent height across video
+            print(f"\nStep 7 - Bowler height across video:")
+            for si in sample_indices:
+                f = valid_frames[si]
+                kp = f["keypoints"]
+                nose = kp[0]
+                ank_l = kp[27]
+                ank_r = kp[28]
+                if nose and (ank_l or ank_r):
+                    ank_y = max(ank_l["y"] if ank_l else 0, ank_r["y"] if ank_r else 0)
+                    h_px = ank_y - nose["y"]
+                    print(f"  Frame {f['frame']}: nose_y={nose['y']:.0f} ank_y={ank_y:.0f} → height={h_px:.0f}px (vis={nose['visibility']:.2f})")
+                else:
+                    print(f"  Frame {f['frame']}: missing nose or ankle")
+        
+        print(f"{'='*60}\n")
+
+        # Include diagnostics in response for frontend logging
+        diag = {
+            "skip": skip,
+            "scale": round(min(640/width, 640/height), 3),
+            "model_input": f"{int(width*min(640/width,640/height))}x{int(height*min(640/width,640/height))}",
+            "valid_frames": len(valid_frames),
+            "slomo_factor": slomo_factor,
+            "real_fps": round(video_fps / skip * slomo_factor, 1) if slomo_factor > 1 else round(video_fps / skip, 1),
+            "time_gap_ms": round(skip / video_fps / slomo_factor * 1000, 1) if slomo_factor > 1 else round(skip / video_fps * 1000, 1),
+        }
+        job["video_info"]["diagnostics"] = diag
+
         job["video_info"]["frames_analyzed"] = len(frames)
         job["frames"] = frames
         job["status"] = "complete"
