@@ -417,9 +417,14 @@ def process_ball_tracking(job_id):
                     job["video_info"]["method"] = method
 
         if use_roboflow:
-            print(f"Ball job {job_id}: processing {total_analysis} frames via Roboflow API with TILING (skip={skip})")
-            print(f"Ball job {job_id}: frame size {width}x{height} — will tile into ~{max(1, height // width)} strips for better detection")
-
+            # TWO-PASS APPROACH:
+            # Pass 1: Coarse scan (skip=8) to find rough time window where ball appears
+            # Pass 2: Dense scan (skip=1) in that window for accurate trajectory
+            coarse_skip = max(1, int(video_fps * slomo_factor / 30))
+            total_analysis = total_frames // coarse_skip
+            print(f"Ball job {job_id}: Pass 1 — coarse scan, {total_analysis} frames (skip={coarse_skip})")
+            
+            coarse_candidates = []
             target_frame = 0
             while target_frame < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
@@ -427,59 +432,95 @@ def process_ball_tracking(job_id):
                 if not ret:
                     break
                 time_s = target_frame / video_fps / slomo_factor
-
-                # Send FULL frame — tiling inside detect_ball_roboflow handles resolution
                 detections = detect_ball_roboflow(frame, conf_thresh=0.08)
-
                 if detections:
-                    # Collect ALL detections, not just the best — the real ball might
-                    # have lower confidence than a static false positive (stump, net mark)
                     for det in detections:
-                        raw_candidates.append({
+                        coarse_candidates.append({
                             "frame": target_frame, "time": round(time_s, 4),
                             "x": round(det["nx"], 4), "y": round(det["ny"], 4),
                             "conf": det["confidence"],
                         })
                 frames_done += 1
                 job["frames_done"] = frames_done
-                job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
-                target_frame += skip
-                if frames_done % 20 == 0:
-                    print(f"Ball job {job_id}: {frames_done}/{total_analysis} frames, {len(raw_candidates)} detections so far")
-
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 40)
+                target_frame += coarse_skip
+            
+            print(f"Ball job {job_id}: Pass 1 found {len(coarse_candidates)} raw detections")
+            
+            # Remove static clusters from coarse pass
+            from collections import defaultdict
+            grid = defaultdict(list)
+            for i, c in enumerate(coarse_candidates):
+                gx = round(c["x"] / 0.03)
+                gy = round(c["y"] / 0.03)
+                grid[(gx, gy)].append(i)
+            
+            static_indices = set()
+            threshold = max(3, len(coarse_candidates) * 0.3)
+            for cell, indices in grid.items():
+                if len(indices) >= threshold:
+                    print(f"Ball job {job_id}: STATIC cluster at ({cell[0]*0.03:.2f}, {cell[1]*0.03:.2f}) — {len(indices)} detections")
+                    static_indices.update(indices)
+            
+            moving = [c for i, c in enumerate(coarse_candidates) if i not in static_indices]
+            print(f"Ball job {job_id}: After static removal: {len(moving)} moving detections")
+            
+            # Pass 2: Dense scan around any moving detections
+            if moving:
+                # Find time window: expand around detected frames
+                det_frames = sorted(set(c["frame"] for c in moving))
+                min_frame = max(0, min(det_frames) - coarse_skip * 5)
+                max_frame = min(total_frames, max(det_frames) + coarse_skip * 5)
+                dense_frames = max_frame - min_frame
+                print(f"Ball job {job_id}: Pass 2 — dense scan frames {min_frame}-{max_frame} ({dense_frames} frames, skip=2)")
+                
+                dense_skip = 2  # analyze every 2nd frame in the window
+                target_frame = min_frame
+                while target_frame < max_frame:
+                    # Skip frames already analyzed in coarse pass
+                    if target_frame % coarse_skip != 0:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                        ret, frame = cap.read()
+                        if ret:
+                            time_s = target_frame / video_fps / slomo_factor
+                            detections = detect_ball_roboflow(frame, conf_thresh=0.08)
+                            if detections:
+                                for det in detections:
+                                    moving.append({
+                                        "frame": target_frame, "time": round(time_s, 4),
+                                        "x": round(det["nx"], 4), "y": round(det["ny"], 4),
+                                        "conf": det["confidence"],
+                                    })
+                        frames_done += 1
+                        job["frames_done"] = frames_done
+                    target_frame += dense_skip
+                
+                # Remove static from dense pass too
+                grid2 = defaultdict(list)
+                for i, c in enumerate(moving):
+                    gx = round(c["x"] / 0.03)
+                    gy = round(c["y"] / 0.03)
+                    grid2[(gx, gy)].append(i)
+                static2 = set()
+                threshold2 = max(3, len(moving) * 0.3)
+                for cell, indices in grid2.items():
+                    if len(indices) >= threshold2:
+                        static2.update(indices)
+                if static2:
+                    moving = [c for i, c in enumerate(moving) if i not in static2]
+                    print(f"Ball job {job_id}: Dense pass static removal: {len(static2)} removed, {len(moving)} remaining")
+                
+                raw_candidates = sorted(moving, key=lambda c: c["frame"])
+                print(f"Ball job {job_id}: Total moving detections after both passes: {len(raw_candidates)}")
+            else:
+                print(f"Ball job {job_id}: No moving detections in coarse pass")
+                raw_candidates = []
+            
             cap.release()
-            print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} total detections in {frames_done} frames")
-
-            # Log all detection positions for debugging
+            
             if raw_candidates:
                 for i, c in enumerate(raw_candidates[:10]):
                     print(f"Ball job {job_id}: detection {i}: frame={c['frame']} x={c['x']:.3f} y={c['y']:.3f} conf={c['conf']:.3f}")
-
-            # ═══ SEPARATE STATIC FALSE POSITIVES FROM MOVING BALL ═══
-            # Static objects (stumps, net marks) appear at the same position in every frame.
-            # The real ball moves. Cluster detections by position, remove the static cluster.
-            if len(raw_candidates) >= 3:
-                # Find position clusters using simple grid
-                from collections import defaultdict
-                grid = defaultdict(list)
-                for i, c in enumerate(raw_candidates):
-                    # Grid cells of 3% of frame
-                    gx = round(c["x"] / 0.03)
-                    gy = round(c["y"] / 0.03)
-                    grid[(gx, gy)].append(i)
-                
-                # Any grid cell with >40% of all detections is likely a static object
-                static_indices = set()
-                threshold = len(raw_candidates) * 0.4
-                for cell, indices in grid.items():
-                    if len(indices) >= threshold:
-                        print(f"Ball job {job_id}: STATIC cluster at ({cell[0]*0.03:.2f}, {cell[1]*0.03:.2f}) — {len(indices)} detections (removing)")
-                        static_indices.update(indices)
-                
-                if static_indices:
-                    moving = [c for i, c in enumerate(raw_candidates) if i not in static_indices]
-                    print(f"Ball job {job_id}: Removed {len(static_indices)} static detections, {len(moving)} remaining")
-                    raw_candidates = moving
 
         # ═══ SECONDARY: Local ONNX model ═══
         elif use_ml:
