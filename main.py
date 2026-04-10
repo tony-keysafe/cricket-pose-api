@@ -47,6 +47,50 @@ INPUT_SIZE = 640
 session = None
 ball_session = None  # Will be loaded when custom model is deployed
 
+# Roboflow hosted model for cricket ball detection
+ROBOFLOW_API_KEY = "Ve9LS6zfaXWJp8IQCDnA"
+ROBOFLOW_MODEL_ID = "cricket-dataset-z2wkt-ko5pz/1"
+ROBOFLOW_URL = f"https://detect.roboflow.com/{ROBOFLOW_MODEL_ID}"
+
+
+def detect_ball_roboflow(frame, conf_thresh=0.15):
+    """Detect cricket ball using Roboflow hosted API."""
+    _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    img_bytes = img_encoded.tobytes()
+    import base64
+    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+    try:
+        resp = requests.post(
+            ROBOFLOW_URL,
+            params={"api_key": ROBOFLOW_API_KEY, "confidence": int(conf_thresh * 100)},
+            data=img_b64,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        h, w = frame.shape[:2]
+        detections = []
+        for pred in data.get("predictions", []):
+            cx = pred["x"] / w
+            cy = pred["y"] / h
+            detections.append({
+                "nx": round(cx, 4),
+                "ny": round(cy, 4),
+                "confidence": round(pred["confidence"], 3),
+                "x": round(pred["x"], 1),
+                "y": round(pred["y"], 1),
+                "w": round(pred["width"], 1),
+                "h": round(pred["height"], 1),
+            })
+        detections.sort(key=lambda d: d["confidence"], reverse=True)
+        return detections[:3]
+    except Exception as e:
+        print(f"Roboflow API error: {e}")
+        return []
+
 # In-memory job store (fine for single-instance Railway deployment)
 jobs = {}
 
@@ -241,16 +285,23 @@ def process_ball_tracking(job_id):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # Analyze every frame for slo-mo, every 2nd for 30fps
-        skip = max(1, int(video_fps / 60))
+        # For Roboflow API: use larger skip to avoid excessive API calls
+        if use_roboflow:
+            # Target ~15 frames per second of real time (enough for trajectory)
+            skip = max(1, int(video_fps * slomo_factor / 15))
+        else:
+            skip = max(1, int(video_fps / 60))
         total_analysis = total_frames // skip
         use_ml = ball_session is not None
+        use_roboflow = bool(ROBOFLOW_API_KEY)
+        method = "roboflow_api" if use_roboflow else ("yolov11_local" if use_ml else "hsv_color")
         job["video_info"] = {
             "width": width, "height": height,
             "fps": round(video_fps, 2),
             "total_frames": total_frames,
             "slomo_factor": slomo_factor,
             "real_duration": round(total_frames / video_fps / slomo_factor, 3),
-            "method": "yolov11_cricket" if use_ml else "hsv_color",
+            "method": method,
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
@@ -258,8 +309,38 @@ def process_ball_tracking(job_id):
         raw_candidates = []
         frames_done = 0
 
-        # ═══ PRIMARY: ML ball detection (custom trained YOLOv11) ═══
-        if use_ml:
+        # ═══ PRIMARY: Roboflow hosted API (GPU-accelerated) ═══
+        if use_roboflow:
+            print(f"Ball job {job_id}: using Roboflow API ({ROBOFLOW_MODEL_ID})")
+            target_frame = 0
+            rf_errors = 0
+            while target_frame < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                time_s = target_frame / video_fps / slomo_factor
+                detections = detect_ball_roboflow(frame, conf_thresh=0.15)
+                if detections:
+                    best = detections[0]
+                    raw_candidates.append({
+                        "frame": target_frame, "time": round(time_s, 4),
+                        "x": best["nx"], "y": best["ny"],
+                        "conf": best["confidence"],
+                    })
+                elif not detections and rf_errors == 0:
+                    # First empty result might just be no ball in frame
+                    pass
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
+                target_frame += skip
+
+            cap.release()
+            print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} candidates in {frames_done} frames")
+
+        # ═══ SECONDARY: Local ONNX model ═══
+        elif use_ml:
             print(f"Ball job {job_id}: using ML detection (custom YOLOv11)")
             input_name = ball_session.get_inputs()[0].name
             target_frame = 0
@@ -622,7 +703,7 @@ async def startup():
             ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
         except Exception as e:
             print(f"Ball model warmup failed: {e}")
-    print(f"Models warmed up! Ball detection: {'ML (custom YOLOv11)' if ball_session else 'HSV fallback'}")
+    print(f"Models warmed up! Ball detection: {'Roboflow API (' + ROBOFLOW_MODEL_ID + ')' if ROBOFLOW_API_KEY else 'ML (custom YOLOv11)' if ball_session else 'HSV fallback'}")
     # Initialize Stripe (optional — works without it)
     if init_stripe():
         print("Stripe payment system ready")
@@ -632,7 +713,13 @@ async def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": session is not None}
+    ball_method = "roboflow_api" if ROBOFLOW_API_KEY else "local_onnx" if ball_session else "hsv_fallback"
+    return {
+        "status": "ok",
+        "model_loaded": session is not None,
+        "ball_detection": ball_method,
+        "roboflow_model": ROBOFLOW_MODEL_ID if ROBOFLOW_API_KEY else None,
+    }
 
 
 @app.get("/")
