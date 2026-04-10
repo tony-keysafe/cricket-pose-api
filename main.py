@@ -50,45 +50,71 @@ ball_session = None  # Will be loaded when custom model is deployed
 # Roboflow hosted model for cricket ball detection
 ROBOFLOW_API_KEY = "Ve9LS6zfaXWJp8IQCDnA"
 ROBOFLOW_MODEL_ID = "cricket-dataset-z2wkt-ko5pz/1"
-ROBOFLOW_URL = f"https://detect.roboflow.com/{ROBOFLOW_MODEL_ID}"
+# Try serverless first (for YOLOv11 models), fall back to detect API
+ROBOFLOW_URLS = [
+    f"https://serverless.roboflow.com/{ROBOFLOW_MODEL_ID}",
+    f"https://detect.roboflow.com/{ROBOFLOW_MODEL_ID}",
+]
+ROBOFLOW_URL = ROBOFLOW_URLS[0]  # Will be updated on first successful call
 
 
 def detect_ball_roboflow(frame, conf_thresh=0.15):
-    """Detect cricket ball using Roboflow hosted API."""
-    _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    img_bytes = img_encoded.tobytes()
-    import base64
-    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-
+    """Detect cricket ball using Roboflow hosted API. Tries multiple endpoints."""
+    global ROBOFLOW_URL
     try:
-        resp = requests.post(
-            ROBOFLOW_URL,
-            params={"api_key": ROBOFLOW_API_KEY, "confidence": int(conf_thresh * 100)},
-            data=img_b64,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        h, w = frame.shape[:2]
-        detections = []
-        for pred in data.get("predictions", []):
-            cx = pred["x"] / w
-            cy = pred["y"] / h
-            detections.append({
-                "nx": round(cx, 4),
-                "ny": round(cy, 4),
-                "confidence": round(pred["confidence"], 3),
-                "x": round(pred["x"], 1),
-                "y": round(pred["y"], 1),
-                "w": round(pred["width"], 1),
-                "h": round(pred["height"], 1),
-            })
-        detections.sort(key=lambda d: d["confidence"], reverse=True)
-        return detections[:3]
+        _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        img_bytes = img_encoded.tobytes()
+
+        # Try current URL first, then fall back to alternatives
+        urls_to_try = [ROBOFLOW_URL] + [u for u in ROBOFLOW_URLS if u != ROBOFLOW_URL]
+
+        for url in urls_to_try:
+            try:
+                resp = requests.post(
+                    url,
+                    params={
+                        "api_key": ROBOFLOW_API_KEY,
+                        "confidence": int(conf_thresh * 100),
+                        "overlap": 30,
+                    },
+                    files={"file": ("frame.jpg", img_bytes, "image/jpeg")},
+                    timeout=15,
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    predictions = data.get("predictions", [])
+                    if url != ROBOFLOW_URL:
+                        print(f"Roboflow: switching to working URL: {url}")
+                        ROBOFLOW_URL = url
+
+                    h, w = frame.shape[:2]
+                    detections = []
+                    for pred in predictions:
+                        cx = pred.get("x", 0)
+                        cy = pred.get("y", 0)
+                        conf = pred.get("confidence", 0)
+                        detections.append({
+                            "nx": round(cx / w, 4),
+                            "ny": round(cy / h, 4),
+                            "confidence": round(conf, 3),
+                            "x": round(cx, 1),
+                            "y": round(cy, 1),
+                            "w": round(pred.get("width", 0), 1),
+                            "h": round(pred.get("height", 0), 1),
+                        })
+                    detections.sort(key=lambda d: d["confidence"], reverse=True)
+                    return detections[:3]
+                else:
+                    print(f"Roboflow {url}: HTTP {resp.status_code} — {resp.text[:200]}")
+            except requests.exceptions.Timeout:
+                print(f"Roboflow {url}: timeout")
+            except Exception as e:
+                print(f"Roboflow {url}: {e}")
+
+        return []
     except Exception as e:
-        print(f"Roboflow API error: {e}")
+        print(f"Roboflow detection error: {e}")
         return []
 
 # In-memory job store (fine for single-instance Railway deployment)
@@ -311,9 +337,23 @@ def process_ball_tracking(job_id):
 
         # ═══ PRIMARY: Roboflow hosted API (GPU-accelerated) ═══
         if use_roboflow:
-            print(f"Ball job {job_id}: using Roboflow API ({ROBOFLOW_MODEL_ID})")
+            print(f"Ball job {job_id}: testing Roboflow API ({ROBOFLOW_MODEL_ID})...")
+            # Test on first frame to verify API is working
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 2)
+            ret, test_frame = cap.read()
+            if ret:
+                test_result = detect_ball_roboflow(test_frame, conf_thresh=0.05)
+                print(f"Ball job {job_id}: Roboflow test — {len(test_result)} detections on middle frame")
+                if test_result is None:
+                    # API is broken, fall back
+                    print(f"Ball job {job_id}: Roboflow API failed, falling back to HSV")
+                    use_roboflow = False
+                    method = "hsv_color"
+                    job["video_info"]["method"] = method
+
+        if use_roboflow:
+            print(f"Ball job {job_id}: processing {total_analysis} frames via Roboflow API (skip={skip})")
             target_frame = 0
-            rf_errors = 0
             while target_frame < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 ret, frame = cap.read()
@@ -328,13 +368,13 @@ def process_ball_tracking(job_id):
                         "x": best["nx"], "y": best["ny"],
                         "conf": best["confidence"],
                     })
-                elif not detections and rf_errors == 0:
-                    # First empty result might just be no ball in frame
-                    pass
                 frames_done += 1
                 job["frames_done"] = frames_done
                 job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
                 target_frame += skip
+                # Log progress every 20 frames
+                if frames_done % 20 == 0:
+                    print(f"Ball job {job_id}: {frames_done}/{total_analysis} frames, {len(raw_candidates)} detections so far")
 
             cap.release()
             print(f"Ball job {job_id}: Roboflow found {len(raw_candidates)} candidates in {frames_done} frames")
