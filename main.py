@@ -286,14 +286,14 @@ def process_ball_tracking(job_id):
 
         # Analyze every frame for slo-mo, every 2nd for 30fps
         # For Roboflow API: use larger skip to avoid excessive API calls
+        use_ml = ball_session is not None
+        use_roboflow = bool(ROBOFLOW_API_KEY)
         if use_roboflow:
             # Target ~15 frames per second of real time (enough for trajectory)
             skip = max(1, int(video_fps * slomo_factor / 15))
         else:
             skip = max(1, int(video_fps / 60))
         total_analysis = total_frames // skip
-        use_ml = ball_session is not None
-        use_roboflow = bool(ROBOFLOW_API_KEY)
         method = "roboflow_api" if use_roboflow else ("yolov11_local" if use_ml else "hsv_color")
         job["video_info"] = {
             "width": width, "height": height,
