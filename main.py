@@ -252,8 +252,20 @@ def postprocess(output, scale, conf_thresh=0.25):
     return mp_landmarks, round(total_conf / max(count, 1), 3)
 
 
-def detect_slomo(path):
-    """Detect iPhone slo-mo videos and return the speedup factor needed."""
+def detect_slomo(path, override_factor=None):
+    """Detect iPhone slo-mo videos and return the speedup factor needed.
+    
+    CRITICAL: time_base=1/2400 is timestamp precision, NOT native fps.
+    iPhone shoots slo-mo at BOTH 120fps and 240fps, both use time_base=1/2400.
+    We can't reliably distinguish them from metadata alone.
+    
+    Strategy: try both factors, pick the one giving a reasonable real duration
+    for a bowling delivery (2-7 seconds). Allow user override.
+    """
+    if override_factor and override_factor > 1:
+        print(f"Slo-mo: using user override factor={override_factor}")
+        return override_factor
+        
     try:
         import subprocess, json
         result = subprocess.run(
@@ -266,25 +278,35 @@ def detect_slomo(path):
         tags = data.get("format", {}).get("tags", {})
         full_rate = tags.get("com.apple.quicktime.full-frame-rate-playback-intent", "1")
 
-        # Check time_base for high native fps
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "video":
                 time_base = stream.get("time_base", "")
                 r_frame_rate = stream.get("r_frame_rate", "0/1")
-                # Parse time_base denominator (e.g. "1/2400" → 2400)
+                duration = float(stream.get("duration", 0))
                 tb_denom = int(time_base.split("/")[1]) if "/" in time_base else 0
-                # Parse display fps
                 num, den = r_frame_rate.split("/") if "/" in r_frame_rate else ("0", "1")
                 display_fps = int(num) / max(int(den), 1)
 
-                # If time_base suggests much higher fps than display fps, it's slo-mo
-                # e.g. time_base=1/2400 with display 60fps → native 240fps → 4x slowdown
                 if tb_denom >= 240 and display_fps < 120 and full_rate == "0":
-                    # Native fps is approximately time_base_denom / 10
-                    native_fps = tb_denom / 10  # 2400/10=240, 1200/10=120
-                    factor = native_fps / display_fps
-                    if factor > 1.5:
-                        return round(factor, 1)
+                    # It's slo-mo, but is it 120fps (4x) or 240fps (8x)?
+                    # Try both and pick the one giving reasonable bowling duration
+                    candidates = []
+                    for native in [120, 240]:
+                        factor = native / display_fps
+                        real_duration = duration / factor
+                        # A bowling delivery video should be 1.5-8 seconds real time
+                        # Score: closer to 3-5 seconds = more likely correct
+                        if real_duration > 0:
+                            dist_from_ideal = abs(real_duration - 4.0)
+                            candidates.append((factor, native, real_duration, dist_from_ideal))
+                            print(f"Slo-mo candidate: {native}fps → {factor}x → {real_duration:.1f}s real duration")
+                    
+                    if candidates:
+                        # Pick the factor giving duration closest to ideal bowling video length
+                        best = min(candidates, key=lambda c: c[3])
+                        print(f"Slo-mo: selected {best[1]}fps ({best[0]}x) → {best[2]:.1f}s real duration")
+                        return round(best[0], 1)
+                        
         return 1.0
     except Exception as e:
         print(f"Slo-mo detection failed: {e}")
