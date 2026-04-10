@@ -42,9 +42,10 @@ app.add_middleware(
 
 MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_PATH = "/app/yolov8n-pose.onnx"
+BALL_MODEL_PATH = "/app/cricket-ball-yolov11.onnx"  # Custom trained cricket ball detection model
 INPUT_SIZE = 640
 session = None
-ball_session = None  # Reserved for future ML ball detection
+ball_session = None  # Will be loaded when custom model is deployed
 
 # In-memory job store (fine for single-instance Railway deployment)
 jobs = {}
@@ -231,143 +232,180 @@ def process_ball_tracking(job_id):
         # Analyze every frame for slo-mo, every 2nd for 30fps
         skip = max(1, int(video_fps / 60))
         total_analysis = total_frames // skip
+        use_ml = ball_session is not None
         job["video_info"] = {
             "width": width, "height": height,
             "fps": round(video_fps, 2),
             "total_frames": total_frames,
             "slomo_factor": slomo_factor,
             "real_duration": round(total_frames / video_fps / slomo_factor, 3),
-            "method": "hsv_color",
+            "method": "yolov11_cricket" if use_ml else "hsv_color",
         }
         job["total_frames"] = total_analysis
         job["status"] = "processing"
 
-        # ═══ STEP 1: Build background model (median of ~15 evenly-spaced frames) ═══
-        bg_indices = np.linspace(0, total_frames - 1, 15, dtype=int)
-        bg_frames = []
-        for idx in bg_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if ret:
-                bg_frames.append(frame.astype(np.float32))
-        bg_model = np.median(np.array(bg_frames), axis=0).astype(np.uint8) if len(bg_frames) >= 5 else None
-        bg_hsv = cv2.cvtColor(bg_model, cv2.COLOR_BGR2HSV) if bg_model is not None else None
-        print(f"Ball job {job_id}: background model from {len(bg_frames)} frames")
-
-        # ═══ STEP 2: Detect ball candidates in each frame ═══
-        # HSV ranges based on selected ball color
-        hsv_ranges = {
-            'red': [
-                (np.array([0, 70, 50]), np.array([12, 255, 255])),
-                (np.array([165, 70, 50]), np.array([180, 255, 255])),
-            ],
-            'pink': [
-                (np.array([140, 30, 100]), np.array([175, 200, 255])),
-                (np.array([0, 40, 150]), np.array([10, 180, 255])),  # pinkish-red
-            ],
-            'white': [
-                (np.array([0, 0, 200]), np.array([180, 50, 255])),
-            ],
-        }
-        color_ranges = hsv_ranges.get(ball_color, hsv_ranges['red'])
-        print(f"Ball job {job_id}: detecting {ball_color} ball with {len(color_ranges)} HSV ranges")
-
-        # Pitch-only mask: center strip of frame
-        pitch_mask = np.zeros((height, width), dtype=np.uint8)
-        px1, px2 = int(width * 0.25), int(width * 0.75)
-        pitch_mask[:, px1:px2] = 255
-
-        # Ball size constraints (in pixels)
-        min_ball_area = max(3, int(width * height * 0.00002))  # Tiny at far end
-        max_ball_area = int(width * height * 0.005)  # Bigger close to camera
-
         raw_candidates = []
         frames_done = 0
 
-        target_frame = 0
-        while target_frame < total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # ═══ PRIMARY: ML ball detection (custom trained YOLOv11) ═══
+        if use_ml:
+            print(f"Ball job {job_id}: using ML detection (custom YOLOv11)")
+            input_name = ball_session.get_inputs()[0].name
+            target_frame = 0
+            while target_frame < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                time_s = target_frame / video_fps / slomo_factor
+                blob, scale = preprocess(frame)
+                outputs = ball_session.run(None, {input_name: blob})
+                detections = postprocess_ball(outputs, scale, width, height)
+                if detections:
+                    best = detections[0]
+                    raw_candidates.append({
+                        "frame": target_frame, "time": round(time_s, 4),
+                        "x": best["nx"], "y": best["ny"],
+                        "conf": best["confidence"],
+                    })
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
+                target_frame += skip
 
-            time_s = target_frame / video_fps / slomo_factor
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            cap.release()
+            print(f"Ball job {job_id}: ML detection found {len(raw_candidates)} candidates in {frames_done} frames")
 
-            # Color mask for selected ball color
-            color_mask = np.zeros((height, width), dtype=np.uint8)
-            for lower, upper in color_ranges:
-                color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, lower, upper))
+        # ═══ FALLBACK: HSV color detection ═══
+        else:
+            print(f"Ball job {job_id}: using HSV color fallback")
 
-            # Subtract background color to reduce static colored objects
-            if bg_hsv is not None:
-                bg_color = np.zeros((height, width), dtype=np.uint8)
+            # STEP 1: Build background model
+            bg_indices = np.linspace(0, total_frames - 1, 15, dtype=int)
+            bg_frames = []
+            for idx in bg_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                ret, frame = cap.read()
+                if ret:
+                    bg_frames.append(frame.astype(np.float32))
+            bg_model = np.median(np.array(bg_frames), axis=0).astype(np.uint8) if len(bg_frames) >= 5 else None
+            bg_hsv = cv2.cvtColor(bg_model, cv2.COLOR_BGR2HSV) if bg_model is not None else None
+            print(f"Ball job {job_id}: background model from {len(bg_frames)} frames")
+
+            # ═══ STEP 2: Detect ball candidates in each frame ═══
+            # HSV ranges based on selected ball color
+            hsv_ranges = {
+                'red': [
+                    (np.array([0, 70, 50]), np.array([12, 255, 255])),
+                    (np.array([165, 70, 50]), np.array([180, 255, 255])),
+                ],
+                'pink': [
+                    (np.array([140, 30, 100]), np.array([175, 200, 255])),
+                    (np.array([0, 40, 150]), np.array([10, 180, 255])),  # pinkish-red
+                ],
+                'white': [
+                    (np.array([0, 0, 200]), np.array([180, 50, 255])),
+                ],
+            }
+            color_ranges = hsv_ranges.get(ball_color, hsv_ranges['red'])
+            print(f"Ball job {job_id}: detecting {ball_color} ball with {len(color_ranges)} HSV ranges")
+
+            # Pitch-only mask: center strip of frame
+            pitch_mask = np.zeros((height, width), dtype=np.uint8)
+            px1, px2 = int(width * 0.25), int(width * 0.75)
+            pitch_mask[:, px1:px2] = 255
+
+            # Ball size constraints (in pixels)
+            min_ball_area = max(3, int(width * height * 0.00002))  # Tiny at far end
+            max_ball_area = int(width * height * 0.005)  # Bigger close to camera
+
+            raw_candidates = []
+            frames_done = 0
+
+            target_frame = 0
+            while target_frame < total_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                time_s = target_frame / video_fps / slomo_factor
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+                # Color mask for selected ball color
+                color_mask = np.zeros((height, width), dtype=np.uint8)
                 for lower, upper in color_ranges:
-                    bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, lower, upper))
-                bg_color = cv2.dilate(bg_color, np.ones((5, 5), np.uint8), iterations=2)
-                color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(bg_color))
+                    color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv, lower, upper))
 
-            # Also detect via frame difference from background (catches any color ball)
-            if bg_model is not None:
-                diff = cv2.absdiff(frame, bg_model)
-                diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-                _, motion_mask = cv2.threshold(diff_gray, 35, 255, cv2.THRESH_BINARY)
-                # Combine: pixels that are EITHER ball-colored OR moving (but must be on pitch)
-                combined = cv2.bitwise_or(color_mask, motion_mask)
-            else:
-                combined = color_mask
+                # Subtract background color to reduce static colored objects
+                if bg_hsv is not None:
+                    bg_color = np.zeros((height, width), dtype=np.uint8)
+                    for lower, upper in color_ranges:
+                        bg_color = cv2.bitwise_or(bg_color, cv2.inRange(bg_hsv, lower, upper))
+                    bg_color = cv2.dilate(bg_color, np.ones((5, 5), np.uint8), iterations=2)
+                    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(bg_color))
 
-            # Apply pitch mask
-            combined = cv2.bitwise_and(combined, pitch_mask)
+                # Also detect via frame difference from background (catches any color ball)
+                if bg_model is not None:
+                    diff = cv2.absdiff(frame, bg_model)
+                    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                    _, motion_mask = cv2.threshold(diff_gray, 35, 255, cv2.THRESH_BINARY)
+                    # Combine: pixels that are EITHER ball-colored OR moving (but must be on pitch)
+                    combined = cv2.bitwise_or(color_mask, motion_mask)
+                else:
+                    combined = color_mask
 
-            # Morphological cleanup
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            combined = cv2.erode(combined, kernel, iterations=1)
-            combined = cv2.dilate(combined, kernel, iterations=2)
+                # Apply pitch mask
+                combined = cv2.bitwise_and(combined, pitch_mask)
 
-            # Find contours
-            contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                # Morphological cleanup
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                combined = cv2.erode(combined, kernel, iterations=1)
+                combined = cv2.dilate(combined, kernel, iterations=2)
 
-            frame_candidates = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < min_ball_area or area > max_ball_area:
-                    continue
-                x, y, bw, bh = cv2.boundingRect(cnt)
-                aspect = max(bw, bh) / max(min(bw, bh), 1)
-                if aspect > 3.0:  # Ball is roundish
-                    continue
-                # Circularity check
-                perimeter = cv2.arcLength(cnt, True)
-                circularity = 4 * np.pi * area / max(perimeter * perimeter, 1)
-                cx = (x + bw / 2) / width
-                cy = (y + bh / 2) / height
-                # Score by circularity and color match strength
-                color_score = cv2.mean(color_mask[y:y+bh, x:x+bw])[0] / 255
-                score = circularity * 0.5 + color_score * 0.5
-                frame_candidates.append({
-                    "x": round(cx, 4), "y": round(cy, 4),
-                    "area": area, "score": round(score, 3),
-                    "circ": round(circularity, 2),
-                })
+                # Find contours
+                contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # Keep best candidate per frame
-            if frame_candidates:
-                frame_candidates.sort(key=lambda c: c["score"], reverse=True)
-                best = frame_candidates[0]
-                raw_candidates.append({
-                    "frame": target_frame, "time": round(time_s, 4),
-                    "x": best["x"], "y": best["y"],
-                    "conf": best["score"],
-                })
+                frame_candidates = []
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < min_ball_area or area > max_ball_area:
+                        continue
+                    x, y, bw, bh = cv2.boundingRect(cnt)
+                    aspect = max(bw, bh) / max(min(bw, bh), 1)
+                    if aspect > 3.0:  # Ball is roundish
+                        continue
+                    # Circularity check
+                    perimeter = cv2.arcLength(cnt, True)
+                    circularity = 4 * np.pi * area / max(perimeter * perimeter, 1)
+                    cx = (x + bw / 2) / width
+                    cy = (y + bh / 2) / height
+                    # Score by circularity and color match strength
+                    color_score = cv2.mean(color_mask[y:y+bh, x:x+bw])[0] / 255
+                    score = circularity * 0.5 + color_score * 0.5
+                    frame_candidates.append({
+                        "x": round(cx, 4), "y": round(cy, 4),
+                        "area": area, "score": round(score, 3),
+                        "circ": round(circularity, 2),
+                    })
 
-            frames_done += 1
-            job["frames_done"] = frames_done
-            job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
-            target_frame += skip
+                # Keep best candidate per frame
+                if frame_candidates:
+                    frame_candidates.sort(key=lambda c: c["score"], reverse=True)
+                    best = frame_candidates[0]
+                    raw_candidates.append({
+                        "frame": target_frame, "time": round(time_s, 4),
+                        "x": best["x"], "y": best["y"],
+                        "conf": best["score"],
+                    })
 
-        cap.release()
-        print(f"Ball job {job_id}: {len(raw_candidates)} raw HSV candidates from {frames_done} frames")
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 80)
+                target_frame += skip
+
+            cap.release()
+            print(f"Ball job {job_id}: {len(raw_candidates)} raw HSV candidates from {frames_done} frames")
 
         # ═══ STEP 3: Trajectory filtering ═══
         ball_positions = filter_ball_trajectory(raw_candidates, width, height)
@@ -555,11 +593,26 @@ async def startup():
     print("Loading ONNX pose model...")
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     print(f"Pose model loaded! Input: {session.get_inputs()[0].shape}")
-    # Ball detection uses HSV color — no ML model needed
-    ball_session = None
+
+    # Load custom cricket ball detection model if available
+    if os.path.exists(BALL_MODEL_PATH) and os.path.getsize(BALL_MODEL_PATH) > 100000:
+        try:
+            ball_session = ort.InferenceSession(BALL_MODEL_PATH, providers=['CPUExecutionProvider'])
+            print(f"Cricket ball model loaded! Input: {ball_session.get_inputs()[0].shape}")
+        except Exception as e:
+            print(f"Cricket ball model failed to load: {e}")
+            ball_session = None
+    else:
+        print("No cricket ball model found — ball detection will use HSV fallback")
+
     dummy = np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
     session.run(None, {session.get_inputs()[0].name: dummy})
-    print("Model warmed up! Ball detection: HSV color mode")
+    if ball_session:
+        try:
+            ball_session.run(None, {ball_session.get_inputs()[0].name: dummy})
+        except Exception as e:
+            print(f"Ball model warmup failed: {e}")
+    print(f"Models warmed up! Ball detection: {'ML (custom YOLOv11)' if ball_session else 'HSV fallback'}")
     # Initialize Stripe (optional — works without it)
     if init_stripe():
         print("Stripe payment system ready")
