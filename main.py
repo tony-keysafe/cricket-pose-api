@@ -417,9 +417,36 @@ def process_ball_tracking(job_id):
                     job["video_info"]["method"] = method
 
         if use_roboflow:
-            # TWO-PASS APPROACH:
+            # PASS 0: BACKGROUND FALSE POSITIVE DETECTION
+            # Run detection on first 3 frames (before bowling starts).
+            # Any "ball" detections are false positives (stumps, net marks, pitch marks).
+            # Record their positions and exclude them from all subsequent frames.
+            false_positive_positions = []
+            for bg_frame_idx in [0, 4, 8]:
+                if bg_frame_idx < total_frames:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, bg_frame_idx)
+                    ret, frame = cap.read()
+                    if ret:
+                        bg_dets = detect_ball_roboflow(frame, conf_thresh=0.05)
+                        for det in bg_dets:
+                            false_positive_positions.append((round(det["nx"], 2), round(det["ny"], 2)))
+            
+            if false_positive_positions:
+                print(f"Ball job {job_id}: Pass 0 — found {len(false_positive_positions)} false positive positions (stumps/net marks):")
+                for fp in false_positive_positions:
+                    print(f"  FP at ({fp[0]:.2f}, {fp[1]:.2f})")
+            
+            def is_false_positive(x, y, fp_list, tolerance=0.04):
+                """Check if detection is near a known false positive position."""
+                for fpx, fpy in fp_list:
+                    if abs(x - fpx) < tolerance and abs(y - fpy) < tolerance:
+                        return True
+                return False
+            
+            # THREE-PASS APPROACH:
+            # Pass 0: Background detection (done above)
             # Pass 1: Coarse scan (skip=8) to find rough time window where ball appears
-            # Pass 2: Dense scan (skip=1) in that window for accurate trajectory
+            # Pass 2: Dense scan (skip=2) in that window for accurate trajectory
             coarse_skip = max(1, int(video_fps * slomo_factor / 30))
             total_analysis = total_frames // coarse_skip
             print(f"Ball job {job_id}: Pass 1 — coarse scan, {total_analysis} frames (skip={coarse_skip})")
@@ -435,11 +462,16 @@ def process_ball_tracking(job_id):
                 detections = detect_ball_roboflow(frame, conf_thresh=0.08)
                 if detections:
                     for det in detections:
-                        coarse_candidates.append({
-                            "frame": target_frame, "time": round(time_s, 4),
-                            "x": round(det["nx"], 4), "y": round(det["ny"], 4),
-                            "conf": det["confidence"],
-                        })
+                        nx, ny = round(det["nx"], 4), round(det["ny"], 4)
+                        if not is_false_positive(nx, ny, false_positive_positions):
+                            coarse_candidates.append({
+                                "frame": target_frame, "time": round(time_s, 4),
+                                "x": nx, "y": ny,
+                                "conf": det["confidence"],
+                            })
+                frames_done += 1
+                job["frames_done"] = frames_done
+                job["progress"] = round((frames_done / max(total_analysis, 1)) * 40)
                 frames_done += 1
                 job["frames_done"] = frames_done
                 job["progress"] = round((frames_done / max(total_analysis, 1)) * 40)
@@ -486,11 +518,13 @@ def process_ball_tracking(job_id):
                             detections = detect_ball_roboflow(frame, conf_thresh=0.08)
                             if detections:
                                 for det in detections:
-                                    moving.append({
-                                        "frame": target_frame, "time": round(time_s, 4),
-                                        "x": round(det["nx"], 4), "y": round(det["ny"], 4),
-                                        "conf": det["confidence"],
-                                    })
+                                    nx, ny = round(det["nx"], 4), round(det["ny"], 4)
+                                    if not is_false_positive(nx, ny, false_positive_positions):
+                                        moving.append({
+                                            "frame": target_frame, "time": round(time_s, 4),
+                                            "x": nx, "y": ny,
+                                            "conf": det["confidence"],
+                                        })
                         frames_done += 1
                         job["frames_done"] = frames_done
                     target_frame += dense_skip
