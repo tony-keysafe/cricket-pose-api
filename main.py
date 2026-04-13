@@ -40,8 +40,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_URL = "https://huggingface.co/Xenova/yolov8s-pose/resolve/main/onnx/model.onnx"
-MODEL_PATH = "/app/yolov8s-pose.onnx"
+MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
+MODEL_PATH = "/app/yolov8n-pose.onnx"
 BALL_MODEL_PATH = "/app/cricket-ball-yolov11.onnx"  # Custom trained cricket ball detection model
 INPUT_SIZE = 640
 session = None
@@ -188,7 +188,7 @@ def cleanup_jobs():
 
 
 def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000:
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
         print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB ({MODEL_PATH})")
         return
     if os.path.exists(MODEL_PATH):
@@ -201,7 +201,7 @@ def download_model():
             f.write(chunk)
     size = os.path.getsize(MODEL_PATH)
     print(f"Pose model downloaded: {size/1e6:.1f} MB")
-    if size < 5000000:
+    if size < 1000000:
         raise RuntimeError(f"Model file too small ({size} bytes) — download may have failed")
 
 
