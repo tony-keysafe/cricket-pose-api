@@ -1026,7 +1026,9 @@ def process_video(job_id):
         frames_done = 0
         input_name = session.get_inputs()[0].name
 
-        print(f"Full-frame pose detection: {width}×{height} → scale={min(640/width,640/height):.3f}")
+        print(f"Dual detection: full-frame + crop-zoom for each frame")
+        print(f"  Full-frame: {width}×{height} → scale={min(640/width,640/height):.3f} (for events, strides, distances)")
+        print(f"  Crop-zoom: bowler crop at ~3x resolution (for angles)")
 
         # Use seeking for high-fps videos (much faster than read-skip)
         target_frame = 0
@@ -1037,14 +1039,49 @@ def process_video(job_id):
                 break
 
             time_s = target_frame / video_fps / slomo_factor
+            
+            # Pass 1: Full-frame (stable coordinates for events + distances)
             blob, scale = preprocess(frame)
             outputs = session.run(None, {input_name: blob})
             landmarks, confidence = postprocess(outputs, scale)
+            
+            # Pass 2: Crop-zoom (better joint accuracy for angles)
+            cropped_landmarks = None
+            if landmarks:
+                xs = [lm["x"] for lm in landmarks if lm is not None]
+                ys = [lm["y"] for lm in landmarks if lm is not None]
+                if len(xs) >= 4:
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
+                    box_w = max_x - min_x
+                    box_h = max_y - min_y
+                    pad_x = box_w * 0.5
+                    pad_y = box_h * 0.4
+                    cx1 = max(0, int(min_x - pad_x))
+                    cy1 = max(0, int(min_y - pad_y))
+                    cx2 = min(width, int(max_x + pad_x))
+                    cy2 = min(height, int(max_y + pad_y))
+                    crop = frame[cy1:cy2, cx1:cx2]
+                    blob2, scale2 = preprocess(crop)
+                    outputs2 = session.run(None, {input_name: blob2})
+                    lm2, conf2 = postprocess(outputs2, scale2)
+                    if lm2 and conf2 > confidence * 0.5:
+                        # Map crop coordinates back to full frame
+                        cropped_landmarks = [None] * 33
+                        for idx, lm in enumerate(lm2):
+                            if lm is not None:
+                                cropped_landmarks[idx] = {
+                                    "x": round(lm["x"] + cx1, 1),
+                                    "y": round(lm["y"] + cy1, 1),
+                                    "z": lm["z"],
+                                    "visibility": lm["visibility"],
+                                }
 
             frames.append({
                 "frame": target_frame,
                 "time": round(time_s, 4),
                 "keypoints": landmarks,
+                "cropped_keypoints": cropped_landmarks,
                 "confidence": confidence,
             })
 
