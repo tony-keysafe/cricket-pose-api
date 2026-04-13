@@ -1024,9 +1024,9 @@ def process_video(job_id):
         frames = []
         frame_idx = 0
         frames_done = 0
+        input_name = session.get_inputs()[0].name
 
-        crop_scale = min(640/width, 640/height)
-        print(f"Two-pass pose detection: {width}×{height} (full scale={crop_scale:.3f}, crop will be ~3-4x better)")
+        print(f"Full-frame pose detection: {width}×{height} → scale={min(640/width,640/height):.3f}")
 
         # Use seeking for high-fps videos (much faster than read-skip)
         target_frame = 0
@@ -1036,8 +1036,10 @@ def process_video(job_id):
             if not ret:
                 break
 
-            time_s = target_frame / video_fps / slomo_factor  # Correct for slo-mo playback
-            landmarks, confidence = detect_pose_cropped(frame, session)
+            time_s = target_frame / video_fps / slomo_factor
+            blob, scale = preprocess(frame)
+            outputs = session.run(None, {input_name: blob})
+            landmarks, confidence = postprocess(outputs, scale)
 
             frames.append({
                 "frame": target_frame,
@@ -1428,6 +1430,7 @@ async def analyze_video_sync(
         analysis_fps = video_fps / skip
         frames = []
         frame_idx = 0
+        input_name = session.get_inputs()[0].name
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -1436,7 +1439,9 @@ async def analyze_video_sync(
                 frame_idx += 1
                 continue
             time_s = frame_idx / video_fps
-            landmarks, confidence = detect_pose_cropped(frame, session)
+            blob, scale = preprocess(frame)
+            outputs = session.run(None, {input_name: blob})
+            landmarks, confidence = postprocess(outputs, scale)
             frames.append({
                 "frame": frame_idx,
                 "time": round(time_s, 4),
