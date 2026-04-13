@@ -188,11 +188,18 @@ def cleanup_jobs():
 
 
 def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
-        print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB ({MODEL_PATH})")
-        return
+    # YOLOv8-nano pose is ~13.5MB. If the cached file is much larger (e.g. 46MB small model),
+    # it's the wrong model and must be re-downloaded.
+    EXPECTED_SIZE_MB = 13.5  # nano model
+    MAX_VALID_SIZE_MB = 20   # anything over this is NOT nano
     if os.path.exists(MODEL_PATH):
-        os.remove(MODEL_PATH)
+        size_mb = os.path.getsize(MODEL_PATH) / 1e6
+        if size_mb > 1 and size_mb < MAX_VALID_SIZE_MB:
+            print(f"Pose model already exists: {size_mb:.1f} MB ({MODEL_PATH}) ✓ nano")
+            return
+        else:
+            print(f"⚠️ Model file wrong size: {size_mb:.1f}MB (expected ~{EXPECTED_SIZE_MB}MB nano, max {MAX_VALID_SIZE_MB}MB) — re-downloading")
+            os.remove(MODEL_PATH)
     print(f"Downloading pose model from {MODEL_URL}...")
     r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
     r.raise_for_status()
@@ -203,6 +210,8 @@ def download_model():
     print(f"Pose model downloaded: {size/1e6:.1f} MB")
     if size < 1000000:
         raise RuntimeError(f"Model file too small ({size} bytes) — download may have failed")
+    if size / 1e6 > MAX_VALID_SIZE_MB:
+        raise RuntimeError(f"Model file too large ({size/1e6:.1f}MB) — expected nano (~{EXPECTED_SIZE_MB}MB). Check MODEL_URL.")
 
 
 def preprocess(frame, input_size=INPUT_SIZE):
