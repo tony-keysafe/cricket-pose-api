@@ -216,6 +216,65 @@ def preprocess(frame, input_size=INPUT_SIZE):
     return np.expand_dims(blob, 0), scale
 
 
+def detect_pose_tiled(frame, session_ref, input_size=INPUT_SIZE, conf_thresh=0.25):
+    """Run pose detection with tiling for wide (landscape) frames.
+    
+    Problem: 1920×1080 → 640×360 makes a 210px bowler only 70px in the model.
+    Joints become 2-3px → angle errors of ±30°.
+    
+    Fix: Split into overlapping left/right halves. Each 960×1080 half scales to 
+    568×640 → bowler becomes ~129px → joints at ~5px → angle errors drop to ±10-15°.
+    
+    Falls back to single-frame detection if frame is not wide enough to benefit.
+    """
+    h, w = frame.shape[:2]
+    input_name = session_ref.get_inputs()[0].name
+    
+    # Only tile landscape frames where width > height (side-on cricket video)
+    # and the frame is wide enough that tiling actually helps
+    if w < h * 1.3 or w < 1200:
+        # Portrait or small frame — single detection
+        blob, scale = preprocess(frame, input_size)
+        outputs = session_ref.run(None, {input_name: blob})
+        return postprocess(outputs, scale, conf_thresh)
+    
+    # Split into overlapping left/right halves
+    overlap = w // 6  # ~16% overlap to catch bowler at center
+    mid_x = w // 2
+    
+    tiles = [
+        (0, mid_x + overlap),              # Left tile
+        (mid_x - overlap, w),              # Right tile
+    ]
+    
+    best_landmarks = None
+    best_conf = 0
+    
+    for tile_x1, tile_x2 in tiles:
+        tile = frame[:, tile_x1:tile_x2]
+        tile_w = tile_x2 - tile_x1
+        
+        blob, scale = preprocess(tile, input_size)
+        outputs = session_ref.run(None, {input_name: blob})
+        landmarks, confidence = postprocess(outputs, scale, conf_thresh)
+        
+        if landmarks and confidence > best_conf:
+            # Map tile coordinates back to full frame
+            mapped = [None] * 33
+            for idx, lm in enumerate(landmarks):
+                if lm is not None:
+                    mapped[idx] = {
+                        "x": round(lm["x"] + tile_x1, 1),  # offset X by tile position
+                        "y": lm["y"],                        # Y unchanged
+                        "z": lm["z"],
+                        "visibility": lm["visibility"],
+                    }
+            best_landmarks = mapped
+            best_conf = confidence
+    
+    return best_landmarks, best_conf
+
+
 def postprocess(output, scale, conf_thresh=0.25):
     predictions = output[0]
     if len(predictions.shape) == 3:
@@ -943,7 +1002,12 @@ def process_video(job_id):
         frames = []
         frame_idx = 0
         frames_done = 0
-        input_name = session.get_inputs()[0].name
+
+        # Log tiling decision
+        if width > height * 1.3 and width >= 1200:
+            print(f"Tiled pose detection: {width}×{height} → 2 tiles of ~{width//2 + width//6}×{height}")
+        else:
+            print(f"Single-frame pose detection: {width}×{height}")
 
         # Use seeking for high-fps videos (much faster than read-skip)
         target_frame = 0
@@ -954,9 +1018,7 @@ def process_video(job_id):
                 break
 
             time_s = target_frame / video_fps / slomo_factor  # Correct for slo-mo playback
-            blob, scale = preprocess(frame)
-            outputs = session.run(None, {input_name: blob})
-            landmarks, confidence = postprocess(outputs, scale)
+            landmarks, confidence = detect_pose_tiled(frame, session)
 
             frames.append({
                 "frame": target_frame,
@@ -980,7 +1042,13 @@ def process_video(job_id):
         print(f"{'='*60}")
         print(f"Step 1 - Video: {width}×{height}, {video_fps}fps, {total_frames} frames, slomo={slomo_factor}x")
         print(f"Step 2 - Sampling: skip={skip}, analyzed={len(frames)}, valid={len(valid_frames)} ({100*len(valid_frames)//max(len(frames),1)}%)")
-        print(f"Step 3 - Model input: {width}×{height} → scale={min(640/width, 640/height):.3f} → {int(width*min(640/width,640/height))}×{int(height*min(640/width,640/height))} padded to 640×640")
+        tiled = width > height * 1.3 and width >= 1200
+        if tiled:
+            tile_w = width // 2 + width // 6
+            tile_scale = min(640 / tile_w, 640 / height)
+            print(f"Step 3 - TILED detection: {width}×{height} → 2 tiles of ~{tile_w}×{height} → scale={tile_scale:.3f} → {int(tile_w*tile_scale)}×{int(height*tile_scale)} padded to 640×640")
+        else:
+            print(f"Step 3 - Model input: {width}×{height} → scale={min(640/width, 640/height):.3f} → {int(width*min(640/width,640/height))}×{int(height*min(640/width,640/height))} padded to 640×640")
         
         # Step 4: Sample actual keypoint values
         if len(valid_frames) >= 5:
@@ -1073,10 +1141,19 @@ def process_video(job_id):
         print(f"{'='*60}\n")
 
         # Include diagnostics in response for frontend logging
+        tiled_detection = width > height * 1.3 and width >= 1200
+        if tiled_detection:
+            tile_w = width // 2 + width // 6
+            diag_scale = round(min(640 / tile_w, 640 / height), 3)
+            diag_input = f"{int(tile_w*min(640/tile_w, 640/height))}x{int(height*min(640/tile_w, 640/height))}"
+        else:
+            diag_scale = round(min(640/width, 640/height), 3)
+            diag_input = f"{int(width*min(640/width,640/height))}x{int(height*min(640/width,640/height))}"
         diag = {
             "skip": skip,
-            "scale": round(min(640/width, 640/height), 3),
-            "model_input": f"{int(width*min(640/width,640/height))}x{int(height*min(640/width,640/height))}",
+            "scale": diag_scale,
+            "model_input": diag_input,
+            "tiled": tiled_detection,
             "valid_frames": len(valid_frames),
             "slomo_factor": slomo_factor,
             "real_fps": round(video_fps / skip * slomo_factor, 1) if slomo_factor > 1 else round(video_fps / skip, 1),
@@ -1344,7 +1421,6 @@ async def analyze_video_sync(
         analysis_fps = video_fps / skip
         frames = []
         frame_idx = 0
-        input_name = session.get_inputs()[0].name
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -1353,9 +1429,7 @@ async def analyze_video_sync(
                 frame_idx += 1
                 continue
             time_s = frame_idx / video_fps
-            blob, scale = preprocess(frame)
-            outputs = session.run(None, {input_name: blob})
-            landmarks, confidence = postprocess(outputs, scale)
+            landmarks, confidence = detect_pose_tiled(frame, session)
             frames.append({
                 "frame": frame_idx,
                 "time": round(time_s, 4),
