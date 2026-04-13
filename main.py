@@ -967,9 +967,9 @@ def process_video(job_id):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # Skip frames based on video fps and slo-mo
-        # skip=1: analyze EVERY frame for maximum accuracy (~16 min for 240fps slo-mo)
-        # Once metrics are validated, can increase skip for speed
-        target_real_fps = 240  # effectively no skipping for 240fps slo-mo
+        # skip=2: 164 frames for 240fps slo-mo (8.3ms gaps, ~8 min processing)
+        # Balances accuracy vs pose jitter noise at 70px bowler resolution
+        target_real_fps = 120  # skip=2 for 240fps slo-mo
         if slomo_factor > 1:
             skip = max(1, round(video_fps * slomo_factor / target_real_fps))
         elif video_fps <= 30:
