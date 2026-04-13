@@ -40,8 +40,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
-MODEL_PATH = "/app/yolov8n-pose.onnx"
+MODEL_URL = "https://huggingface.co/Xenova/yolov8s-pose/resolve/main/onnx/model.onnx"
+MODEL_PATH = "/app/yolov8s-pose.onnx"
 BALL_MODEL_PATH = "/app/cricket-ball-yolov11.onnx"  # Custom trained cricket ball detection model
 INPUT_SIZE = 640
 session = None
@@ -188,21 +188,21 @@ def cleanup_jobs():
 
 
 def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1000000:
-        print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5000000:
+        print(f"Pose model already exists: {os.path.getsize(MODEL_PATH)/1e6:.1f} MB ({MODEL_PATH})")
         return
     if os.path.exists(MODEL_PATH):
         os.remove(MODEL_PATH)
-    print(f"Downloading pose model...")
+    print(f"Downloading pose model from {MODEL_URL}...")
     r = requests.get(MODEL_URL, allow_redirects=True, stream=True)
     r.raise_for_status()
     with open(MODEL_PATH, 'wb') as f:
         for chunk in r.iter_content(chunk_size=65536):
             f.write(chunk)
     size = os.path.getsize(MODEL_PATH)
-    print(f"Pose model: {size/1e6:.1f} MB")
-    if size < 1000000:
-        raise RuntimeError(f"Model file too small ({size} bytes)")
+    print(f"Pose model downloaded: {size/1e6:.1f} MB")
+    if size < 5000000:
+        raise RuntimeError(f"Model file too small ({size} bytes) — download may have failed")
 
 
 def preprocess(frame, input_size=INPUT_SIZE):
