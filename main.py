@@ -9,6 +9,7 @@ Changes from previous version:
 - Frame skipping for 30fps video (every 2nd frame)
 """
 import os
+import math
 import uuid
 import time
 import tempfile
@@ -1283,6 +1284,144 @@ def health():
 @app.get("/")
 def root():
     return {"service": "Cricket Analyze Pro - Pose API", "status": "running", "version": "2.0"}
+
+
+@app.post("/analyze-standing")
+async def analyze_standing(
+    image: UploadFile = File(...),
+    height_cm: float = Form(...),
+):
+    """
+    Calibration endpoint: accepts a single standing (T-pose preferred) image
+    and returns body-segment measurements in cm.
+
+    Used by the optional Bowler Profile flow to derive a trustworthy
+    pxPerCm reference plus real-world arm span, torso and leg lengths.
+    These are then used by the analysis pipeline to do per-frame
+    calibration from the bowler's torso length (most stable segment
+    during a bowling action).
+    """
+    # Load pose model (same model used by the video pipeline)
+    if session is None:
+        return JSONResponse(status_code=503, content={"error": "pose model not ready"})
+
+    # Read image
+    content = await image.read()
+    nparr = np.frombuffer(content, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse(status_code=400, content={"error": "could not decode image"})
+
+    # Run pose detection (use the same cropped two-pass path for accuracy)
+    landmarks, conf = detect_pose_cropped(frame, session, conf_thresh=0.2)
+    if not landmarks:
+        return JSONResponse(status_code=422, content={
+            "error": "no person detected",
+            "hint": "Use a clear, full-body photo with heels and crown visible"
+        })
+
+    # Extract keypoints we need (MediaPipe indices)
+    def pt(i):
+        lm = landmarks[i]
+        if lm is None or lm.get("visibility", 0) < 0.15:
+            return None
+        return (lm["x"], lm["y"])
+
+    nose = pt(0)
+    l_shoulder, r_shoulder = pt(11), pt(12)
+    l_wrist, r_wrist = pt(15), pt(16)
+    l_hip, r_hip = pt(23), pt(24)
+    l_ankle, r_ankle = pt(27), pt(28)
+
+    missing = []
+    if not nose: missing.append("head")
+    if not (l_shoulder and r_shoulder): missing.append("shoulders")
+    if not (l_wrist and r_wrist): missing.append("wrists")
+    if not (l_hip and r_hip): missing.append("hips")
+    if not (l_ankle and r_ankle): missing.append("ankles")
+    if missing:
+        return JSONResponse(status_code=422, content={
+            "error": f"could not see: {', '.join(missing)}",
+            "hint": "Stand facing the camera, arms out to the sides, full body in frame"
+        })
+
+    # Midpoints
+    mid = lambda a, b: ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    shoulders_mid = mid(l_shoulder, r_shoulder)
+    hips_mid = mid(l_hip, r_hip)
+    ankles_mid = mid(l_ankle, r_ankle)
+
+    # Pixel measurements
+    def dist(a, b):
+        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+    # Heel-to-crown estimate: nose is top-of-nose, crown sits ~8% of stature above it.
+    # We estimate crown by extending upward along the shoulders->nose vector.
+    nose_to_shoulders = dist(nose, shoulders_mid)
+    # Typical anthropometry: from shoulder mid to crown is ~1.3 × shoulder-to-nose
+    crown_y = nose[1] - 0.25 * nose_to_shoulders  # add ~headtop correction above nose
+    crown = (nose[0], crown_y)
+
+    heel_to_crown_px = dist(ankles_mid, crown)
+    arm_span_px = dist(l_wrist, r_wrist)
+    torso_px = dist(shoulders_mid, hips_mid)
+    leg_px = dist(hips_mid, ankles_mid)
+
+    if heel_to_crown_px < 50:
+        return JSONResponse(status_code=422, content={
+            "error": "bowler appears too small in frame",
+            "hint": "Stand further back or crop less aggressively — we need full body clearly visible"
+        })
+
+    # Reference px/cm from known height
+    reference_px_per_cm = heel_to_crown_px / height_cm
+
+    # Derive real-world cm for the other segments
+    arm_span_cm = arm_span_px / reference_px_per_cm
+    torso_cm = torso_px / reference_px_per_cm
+    leg_cm = leg_px / reference_px_per_cm
+
+    # Ratios (Pitchwolf-style)
+    arm_height_ratio = arm_span_cm / height_cm
+    torso_leg_ratio = torso_cm / leg_cm
+
+    # Build classification (Pitchwolf gives "Core Driver", "Lever Dominant", etc.)
+    if arm_height_ratio >= 1.03:
+        build = "Lever Dominant"
+        build_note = "Long arms relative to height — built for express pace through fast arm speed."
+    elif arm_height_ratio >= 0.98:
+        build = "Balanced Athlete"
+        build_note = "Balanced proportions — adaptable to a range of bowling styles."
+    elif torso_leg_ratio >= 0.80:
+        build = "Power Base"
+        build_note = "Long torso relative to legs — built for seam and swing over express pace."
+    else:
+        build = "Core Driver"
+        build_note = "Built for trunk rotation power rather than long-lever speed."
+
+    return JSONResponse(content={
+        "status": "ok",
+        "confidence": float(conf),
+        "height_cm": height_cm,
+        "measurements": {
+            "arm_span_cm": round(arm_span_cm, 1),
+            "torso_cm": round(torso_cm, 1),
+            "leg_cm": round(leg_cm, 1),
+            "arm_height_ratio": round(arm_height_ratio, 3),
+            "torso_leg_ratio": round(torso_leg_ratio, 3),
+        },
+        "calibration": {
+            "reference_px_per_cm": round(reference_px_per_cm, 4),
+            "heel_to_crown_px": round(heel_to_crown_px, 1),
+            "arm_span_px": round(arm_span_px, 1),
+            "torso_px": round(torso_px, 1),
+            "leg_px": round(leg_px, 1),
+        },
+        "profile": {
+            "build": build,
+            "note": build_note,
+        },
+    })
 
 
 @app.post("/analyze")
