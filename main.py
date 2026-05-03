@@ -1514,6 +1514,109 @@ async def analyze_video(
     return JSONResponse(content={"job_id": job_id, "status": "queued"})
 
 
+# ─── MediaPipe analysis (parallel path) ────────────────────────────
+# Identical job-tracking shape as /analyze, so the existing /status/{job_id}
+# and /results/{job_id} endpoints work for both. The frontend can opt in by
+# calling /analyze-mp instead of /analyze. Returns the same response shape
+# but with all 33 keypoints populated (heel/toe inclusive).
+def process_video_mp(job_id: str):
+    """Background worker: run MediaPipe pose detection, populate the same
+    job-state keys as the YOLO process_video() so existing status/result
+    endpoints work unchanged."""
+    job = jobs[job_id]
+    tmp_path = job["tmp_path"]
+    fps_hint = job["fps"]
+    bowling_arm = job.get("bowling_arm", "right")
+    height_cm = job.get("height_cm")
+
+    try:
+        # Lazy import — if mediapipe isn't installed for any reason, fail
+        # this job cleanly without affecting the YOLO path.
+        from mediapipe_analyzer import analyze_video_mp
+
+        job["status"] = "processing"
+
+        def progress_cb(done, total):
+            job["frames_done"] = done
+            job["total_frames"] = total
+            job["progress"] = round((done / max(total, 1)) * 100)
+
+        result = analyze_video_mp(
+            video_path=tmp_path,
+            fps_hint=fps_hint,
+            height_cm=height_cm,
+            bowling_arm=bowling_arm,
+            progress_cb=progress_cb,
+        )
+
+        # Populate the same job-state keys the YOLO worker uses, so the
+        # /status and /results endpoints work without modification.
+        job["video_info"] = result["video_info"]
+        job["video_info"]["frames_analyzed"] = len(result["frames"])
+        job["frames"] = result["frames"]
+        job["ball_speed"] = result.get("ball_speed")  # None for now; ball detection not in MP path yet
+        job["status"] = "complete"
+        job["progress"] = 100
+        print(f"MP job {job_id}: complete — {len(result['frames'])} frames analyzed")
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        print(f"MP job {job_id}: error — {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/analyze-mp")
+async def analyze_video_mp_endpoint(
+    video: UploadFile = File(...),
+    fps: int = Form(30),
+    height_cm: float = Form(0),
+    bowling_arm: str = Form("right"),
+):
+    """MediaPipe-based pose analysis. Same response shape as /analyze but
+    returns all 33 MediaPipe keypoints (with heel/toe populated).
+
+    Opt-in path — frontend should only call this when explicitly requested
+    (e.g. via a feature flag) until validated end-to-end on real videos.
+
+    No ball-speed detection in this path yet — that runs in the YOLO worker
+    only. We can add it later once MP path is otherwise stable.
+    """
+    cleanup_jobs()
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        content = await video.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "frames_done": 0,
+        "total_frames": 0,
+        "created_at": time.time(),
+        "tmp_path": tmp_path,
+        "fps": fps,
+        "height_cm": height_cm,
+        "bowling_arm": bowling_arm,
+        "calibration": None,  # No ball detection in MP path
+        "analyzer": "mediapipe",  # marker so we can tell paths apart
+    }
+
+    thread = threading.Thread(target=process_video_mp, args=(job_id,), daemon=True)
+    thread.start()
+
+    return JSONResponse(content={"job_id": job_id, "status": "queued", "analyzer": "mediapipe"})
+
+
 @app.post("/upload-ball-model")
 async def upload_ball_model(
     model: UploadFile = File(...),
