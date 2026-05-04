@@ -17,7 +17,7 @@ import numpy as np
 import cv2
 import onnxruntime as ort
 import requests
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -1412,12 +1412,17 @@ def process_video(job_id):
         job["error"] = str(e)
         print(f"Job {job_id}: error — {e}")
     finally:
-        # Clean up temp file
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except Exception:
-            pass
+        # NOTE: tmp_path is INTENTIONALLY kept on disk after analysis completes.
+        # The frontend may call POST /generate-stills/{job_id} with computed
+        # metrics, which needs the video to be readable. Cleanup happens
+        # either inside that endpoint (on success) or via cleanup_jobs() at
+        # the 30-min job expiry — whichever fires first.
+        if job["status"] == "error":
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @app.on_event("startup")
@@ -1566,11 +1571,14 @@ def process_video_mp(job_id: str):
         import traceback
         traceback.print_exc()
     finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except Exception:
-            pass
+        # Same as YOLO worker: keep tmp_path on disk for /generate-stills.
+        # Only delete on error path (no point keeping a video for a failed job).
+        if job["status"] == "error":
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @app.post("/analyze-mp")
@@ -1615,6 +1623,68 @@ async def analyze_video_mp_endpoint(
     thread.start()
 
     return JSONResponse(content={"job_id": job_id, "status": "queued", "analyzer": "mediapipe"})
+
+
+@app.post("/generate-stills/{job_id}")
+async def generate_stills(job_id: str, request: Request):
+    """Render the 13-page key-moments PDF for a completed analysis job.
+
+    The frontend calls this AFTER computeMetrics has run client-side, posting
+    the resolved events/metrics/scores. This endpoint:
+      1) Looks up the job's tmp_path (still on disk because the workers no
+         longer delete on success).
+      2) Renders the stills PDF via stills_pdf.render_stills_pdf().
+      3) Deletes the video file once the PDF is in memory.
+      4) Returns the PDF bytes with Content-Type: application/pdf.
+
+    Failure modes:
+      - 404 if job_id unknown or video already cleaned up
+      - 500 if rendering raises (shouldn't happen — render_stills_pdf
+        skips individual page failures internally)
+
+    The frontend should treat a non-200 response as "no stills PDF this
+    time" and not surface an error to the user — the main analysis report
+    is the primary deliverable.
+    """
+    cleanup_jobs()  # opportunistic — kill stale jobs before doing work
+
+    job = jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Unknown job_id"})
+
+    tmp_path = job.get("tmp_path")
+    if not tmp_path or not os.path.exists(tmp_path):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Video file unavailable (job expired or already collected)"},
+        )
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}"})
+
+    try:
+        from stills_pdf import render_stills_pdf
+        pdf_bytes = render_stills_pdf(tmp_path, payload)
+    except Exception as e:
+        # Lazy import means we'll see import errors here too — still safe to
+        # fail the call without affecting the rest of the analysis.
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Stills PDF generation failed: {e}"},
+        )
+
+    # Success: delete the video so we don't sit on it for the full 30 min.
+    try:
+        os.unlink(tmp_path)
+        job["tmp_path"] = None  # mark as collected
+    except Exception:
+        pass  # cleanup_jobs() will get it later
+
+    return Response(content=pdf_bytes, media_type="application/pdf")
 
 
 @app.post("/upload-ball-model")
