@@ -70,67 +70,88 @@ def _fmt_static(label):
 
 
 # ─── Page plan ─────────────────────────────────────────────────────
-# Frame offsets are heuristic, picked to land on a frame that visually
-# represents the metric. Tuned for v2 events on MP path (BFC = real
-# touchdown, FFC = real plant). YOLO events differ — see notes below.
 #
+# Each page anchors to a detected event (BFC or FFC), then applies:
+#   1. A detector→visual shift (BFC and FFC are detected slightly LATE by the
+#      kinematic algorithm vs when the eye sees them; constants below).
+#   2. A biomechanical offset (where in the bowling action this metric's still
+#      should land relative to the visual event).
+#
+# Both shifts and offsets are in REAL-TIME SECONDS, not frames. This keeps the
+# rule consistent across different fps / slo-mo factors. The renderer converts
+# to frames using `real_fps = native_fps × slomo_factor` at runtime.
+#
+# Calibrated against Zac (IMG_5945.mov, 240 fps real). The biomechanical
+# offsets reflect general bowling-action shape (run-up → bound → delivery)
+# and should approximately hold across bowlers; the detector shifts are
+# properties of the detector, not the bowler.
+
+# Detector→visual shifts: subtract this many seconds from the detected event
+# frame to land on the visually-correct moment.
+BFC_DETECTOR_LAG_S = 16.7e-3   # detector picks BFC ~17ms after the eye sees it
+FFC_DETECTOR_LAG_S = 66.7e-3   # detector picks FFC ~67ms after the eye sees it
+                                # (FFC plateau definition catches the foot only
+                                # once it's fully settled — visible touch is earlier)
+
+# Score threshold below which the value-tag is rendered orange instead of green.
 # `metric_key`   -- key in payload['metrics']; None for static-label pages
 # `score_key`    -- key in payload['scores']; controls tag colour
 # `formatter`    -- function: value → display string
-# `frame_pick`   -- (event_key, offset_in_native_frames)
+# `anchor`       -- 'bfc' or 'ffc' — which detected event drives this page
+# `offset_s`     -- biomechanical offset in seconds from the *visual* event
 # `zone`         -- bucket label shown in top-left corner
 EVENT_PLAN = [
     {'metric_key': 'runupSpeedKmh',   'score_key': 'runupSpeedKmh',
      'label': 'Run-up Speed',         'formatter': _fmt_kmh,
-     'frame_pick': ('bfcFrame', -40), 'zone': 'approach'},
+     'anchor': 'bfc', 'offset_s': -0.258, 'zone': 'approach'},
 
     {'metric_key': 'impStrideCm',     'score_key': 'impStrideCm',
      'label': 'Impulse Stride',       'formatter': _fmt_cm,
-     'frame_pick': ('bfcFrame', -16), 'zone': 'approach'},
+     'anchor': 'bfc', 'offset_s': -0.208, 'zone': 'approach'},
 
     {'metric_key': 'isContactMs',     'score_key': 'isContactMs',
      'label': 'IS Contact Time',      'formatter': _fmt_ms,
-     'frame_pick': ('bfcFrame', -16), 'zone': 'approach'},
+     'anchor': 'bfc', 'offset_s': -0.208, 'zone': 'approach'},
 
     {'metric_key': 'jumpCm',          'score_key': 'jumpCm',
      'label': 'Jump Height',          'formatter': _fmt_cm,
-     'frame_pick': ('bfcFrame', -8),  'zone': 'approach'},
+     'anchor': 'bfc', 'offset_s': -0.054, 'zone': 'approach'},
 
     {'metric_key': None,              'score_key': None,
      'label': 'Back Foot Contact',    'formatter': _fmt_static('Toe strike'),
-     'frame_pick': ('bfcFrame', 0),   'zone': 'impact'},
+     'anchor': 'bfc', 'offset_s': 0.000, 'zone': 'impact'},
 
     {'metric_key': 'bfcContactMs',    'score_key': 'bfcContactMs',
      'label': 'BFC Contact Time',     'formatter': _fmt_ms,
-     'frame_pick': ('bfcFrame', 0),   'zone': 'impact'},
+     'anchor': 'bfc', 'offset_s': 0.000, 'zone': 'impact'},
 
     {'metric_key': 'bfcCollapseDeg',  'score_key': 'bfcCollapseDeg',
      'label': 'Back-Foot Collapse',   'formatter': _fmt_deg,
-     'frame_pick': ('bfcFrame', 12),  'zone': 'impact'},
+     'anchor': 'bfc', 'offset_s': 0.054, 'zone': 'impact'},
 
     {'metric_key': 'ffcContactMs',    'score_key': 'ffcContactMs',
      'label': 'FFC Contact Time',     'formatter': _fmt_ms,
-     'frame_pick': ('ffcFrame', -8),  'zone': 'delivery'},
+     'anchor': 'ffc', 'offset_s': 0.000, 'zone': 'delivery'},
 
     {'metric_key': 'delStrideCm',     'score_key': 'delStrideCm',
      'label': 'Delivery Stride',      'formatter': _fmt_cm,
-     'frame_pick': ('ffcFrame', 0),   'zone': 'impact'},
+     'anchor': 'ffc', 'offset_s': 0.017, 'zone': 'impact'},
 
     {'metric_key': 'contraLimbBelow', 'score_key': 'contraLimbBelow',
      'label': 'Contralateral Arm',    'formatter': _fmt_below,
-     'frame_pick': ('ffcFrame', 0),   'zone': 'delivery'},
+     'anchor': 'ffc', 'offset_s': 0.017, 'zone': 'delivery'},
 
     {'metric_key': 'fkFlexDeg',       'score_key': 'fkFlexDeg',
      'label': 'Front Knee Flexion',   'formatter': _fmt_deg,
-     'frame_pick': ('ffcFrame', 13),  'zone': 'delivery'},
+     'anchor': 'ffc', 'offset_s': 0.071, 'zone': 'delivery'},
 
     {'metric_key': 'trunkFlexDeg',    'score_key': 'trunkFlexDeg',
      'label': 'Trunk Flexion',        'formatter': _fmt_deg,
-     'frame_pick': ('ffcFrame', 16),  'zone': 'impact'},
+     'anchor': 'ffc', 'offset_s': 0.083, 'zone': 'impact'},
 
     {'metric_key': 'armRpm',          'score_key': 'armRpm',
      'label': 'Arm Speed',            'formatter': _fmt_rpm,
-     'frame_pick': ('ffcFrame', 15),  'zone': 'delivery'},
+     'anchor': 'ffc', 'offset_s': 0.079, 'zone': 'delivery'},
 ]
 
 
@@ -248,10 +269,18 @@ def _read_frame(cap: cv2.VideoCapture, frame_idx: int,
 def render_stills_pdf(video_path: str, payload: Dict[str, Any]) -> bytes:
     """Generate a stills PDF and return the bytes.
 
+    Payload required keys (in addition to metrics/scores documented above):
+      events.bfcFrame  -- detected back-foot-contact frame (native-frame index)
+      events.ffcFrame  -- detected front-foot-contact frame (native-frame index)
+      events.realFps   -- real-time fps (native_fps × slomo_factor; e.g. 240)
+
+    The detected events are shifted by the detector→visual lag constants and
+    then the per-page biomechanical offset (in seconds) is applied to land on
+    the visually-correct still moment.
+
     Raises FileNotFoundError if video_path doesn't exist.
-    Raises RuntimeError if cv2 can't open the video.
-    Individual page failures are logged and the page is skipped — the PDF
-    will still contain whatever pages did render successfully.
+    Raises RuntimeError if cv2 can't open the video, or no pages render.
+    Individual page failures are logged and skipped.
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -266,8 +295,22 @@ def render_stills_pdf(video_path: str, payload: Dict[str, Any]) -> bytes:
         metrics = payload.get('metrics') or {}
         scores = payload.get('scores') or {}
 
+        real_fps = events.get('realFps')
+        if not real_fps or real_fps <= 0:
+            # Fall back to native fps × 1 (no slo-mo). Better than crashing.
+            native_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            real_fps = native_fps
+            logger.warning("payload.events.realFps missing — falling back to native %s", real_fps)
+
+        # Visual-event frames (shift detected events by detector lag)
+        bfc_visual = None
+        if events.get('bfcFrame') is not None:
+            bfc_visual = events['bfcFrame'] - BFC_DETECTOR_LAG_S * real_fps
+        ffc_visual = None
+        if events.get('ffcFrame') is not None:
+            ffc_visual = events['ffcFrame'] - FFC_DETECTOR_LAG_S * real_fps
+
         buf = io.BytesIO()
-        # A4 landscape so a 16:9 video frame fits naturally with margins
         page_size = landscape(A4)
         c = canvas.Canvas(buf, pagesize=page_size)
         page_w, page_h = page_size
@@ -276,13 +319,12 @@ def render_stills_pdf(video_path: str, payload: Dict[str, Any]) -> bytes:
         for plan in EVENT_PLAN:
             try:
                 # Determine the frame to render
-                event_key, offset = plan['frame_pick']
-                anchor = events.get(event_key)
-                if anchor is None:
-                    logger.info("Skipping page %r: event %s missing",
-                                plan['label'], event_key)
+                anchor_frame = bfc_visual if plan['anchor'] == 'bfc' else ffc_visual
+                if anchor_frame is None:
+                    logger.info("Skipping page %r: %s event missing",
+                                plan['label'], plan['anchor'].upper())
                     continue
-                frame_idx = int(anchor) + int(offset)
+                frame_idx = round(anchor_frame + plan['offset_s'] * real_fps)
 
                 bgr = _read_frame(cap, frame_idx, total_frames)
                 if bgr is None:
