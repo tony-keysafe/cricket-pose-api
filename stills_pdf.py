@@ -89,9 +89,12 @@ def _fmt_static(label):
 # Detector→visual shifts: subtract this many seconds from the detected event
 # frame to land on the visually-correct moment.
 BFC_DETECTOR_LAG_S = 16.7e-3   # detector picks BFC ~17ms after the eye sees it
-FFC_DETECTOR_LAG_S = 66.7e-3   # detector picks FFC ~67ms after the eye sees it
-                                # (FFC plateau definition catches the foot only
-                                # once it's fully settled — visible touch is earlier)
+FFC_DETECTOR_LAG_S = 8.3e-3    # detector picks FFC ~8ms after the eye sees it
+                                # (heel-anchored FFC, frontend commit d65b6b9:
+                                # detected 218 vs visual 216 on Zac = 2 fr @240.
+                                # Was 66.7e-3 against the old toe-anchored pick
+                                # of 232 — the two shifts cancel: every FFC page
+                                # selects the SAME final frame as before)
 
 # Score threshold below which the value-tag is rendered orange instead of green.
 # `metric_key`   -- key in payload['metrics']; None for static-label pages
