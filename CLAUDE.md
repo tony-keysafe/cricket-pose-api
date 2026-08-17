@@ -108,6 +108,11 @@ checklist on 17 Aug 2026.
 - Roboflow model `cricket-dataset-z2wkt-ko5pz/1` (broadcast-trained) is unreliable for
   behind-stumps net footage. Side-on ball HSV detection (hue 0–15°/165–180°,
   sat > 80) validated at exactly 89 km/h on Zac.
+- **All cm and km/h metrics scale linearly with profile `heightCm`** (verified exactly
+  ×179/158, Aug 2026); angles, times, RPM and frame picks are scale-free. Zac = 179cm.
+  heightCm once changed silently between runs — when cm numbers drift, check the
+  profile height FIRST. Definitions-pass item: print the height used on the report
+  header. Commit fixtures only as exact, unedited exports.
 
 ## Verification rituals
 
